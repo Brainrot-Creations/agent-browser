@@ -484,7 +484,7 @@ This is useful for multimodal AI models that can reason about visual layout, unl
 | `--json` | JSON output (for agents) |
 | `--full, -f` | Full page screenshot |
 | `--annotate` | Annotated screenshot with numbered element labels (or `AGENT_BROWSER_ANNOTATE` env) |
-| `--headed` | Show browser window (not headless) |
+| `--headed` | Show browser window (not headless) (or `AGENT_BROWSER_HEADED` env) |
 | `--cdp <port\|url>` | Connect via Chrome DevTools Protocol (port or WebSocket URL) |
 | `--auto-connect` | Auto-discover and connect to running Chrome (or `AGENT_BROWSER_AUTO_CONNECT` env) |
 | `--color-scheme <scheme>` | Color scheme: `dark`, `light`, `no-preference` (or `AGENT_BROWSER_COLOR_SCHEME` env) |
@@ -657,6 +657,8 @@ agent-browser open example.com --headed
 ```
 
 This opens a visible browser window instead of running headless.
+
+> **Note:** Loading browser extensions (`--extension`) automatically enables headed mode, since Chrome extensions cannot run in headless mode.
 
 ## Authenticated Sessions
 

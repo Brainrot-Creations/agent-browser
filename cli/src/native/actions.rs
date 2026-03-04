@@ -5134,6 +5134,37 @@ fn error_response(id: &str, error: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// RAII guard that locks env mutex and restores env vars on drop
+    struct EnvGuard<'a> {
+        _lock: MutexGuard<'a, ()>,
+        vars: Vec<(String, Option<String>)>,
+    }
+
+    impl<'a> EnvGuard<'a> {
+        fn new(var_names: &[&str]) -> Self {
+            let lock = ENV_MUTEX.lock().unwrap();
+            let vars = var_names
+                .iter()
+                .map(|&name| (name.to_string(), env::var(name).ok()))
+                .collect();
+            Self { _lock: lock, vars }
+        }
+    }
+
+    impl Drop for EnvGuard<'_> {
+        fn drop(&mut self) {
+            for (name, value) in &self.vars {
+                match value {
+                    Some(v) => env::set_var(name, v),
+                    None => env::remove_var(name),
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_success_response_structure() {
@@ -5172,26 +5203,18 @@ mod tests {
 
     #[test]
     fn test_launch_options_from_env_extensions_force_headed() {
-        let prev = env::var("AGENT_BROWSER_EXTENSIONS").ok();
+        let _guard = EnvGuard::new(&["AGENT_BROWSER_EXTENSIONS"]);
         env::set_var("AGENT_BROWSER_EXTENSIONS", "/path/to/ext");
         let opts = launch_options_from_env();
         assert!(!opts.headless, "Extensions should force headless=false");
-        match prev {
-            Some(v) => env::set_var("AGENT_BROWSER_EXTENSIONS", v),
-            None => env::remove_var("AGENT_BROWSER_EXTENSIONS"),
-        }
     }
 
     #[test]
     fn test_launch_options_from_env_headed_flag() {
-        let prev = env::var("AGENT_BROWSER_HEADED").ok();
+        let _guard = EnvGuard::new(&["AGENT_BROWSER_HEADED"]);
         env::set_var("AGENT_BROWSER_HEADED", "1");
         let opts = launch_options_from_env();
         assert!(!opts.headless, "AGENT_BROWSER_HEADED=1 should set headless=false");
-        match prev {
-            Some(v) => env::set_var("AGENT_BROWSER_HEADED", v),
-            None => env::remove_var("AGENT_BROWSER_HEADED"),
-        }
     }
 
     #[tokio::test]

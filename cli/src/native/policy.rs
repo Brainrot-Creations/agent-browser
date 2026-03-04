@@ -135,6 +135,36 @@ impl ActionPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard<'a> {
+        _lock: MutexGuard<'a, ()>,
+        vars: Vec<(String, Option<String>)>,
+    }
+
+    impl<'a> EnvGuard<'a> {
+        fn new(var_names: &[&str]) -> Self {
+            let lock = ENV_MUTEX.lock().unwrap();
+            let vars = var_names
+                .iter()
+                .map(|&name| (name.to_string(), env::var(name).ok()))
+                .collect();
+            Self { _lock: lock, vars }
+        }
+    }
+
+    impl Drop for EnvGuard<'_> {
+        fn drop(&mut self) {
+            for (name, value) in &self.vars {
+                match value {
+                    Some(v) => env::set_var(name, v),
+                    None => env::remove_var(name),
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_policy_allow_whitelist() {
@@ -205,12 +235,12 @@ mod tests {
 
     #[test]
     fn test_confirm_actions_from_env() {
+        let _guard = EnvGuard::new(&["AGENT_BROWSER_CONFIRM_ACTIONS"]);
         env::set_var("AGENT_BROWSER_CONFIRM_ACTIONS", "navigate,click,fill");
         let ca = ConfirmActions::from_env().unwrap();
         assert!(ca.requires_confirmation("navigate"));
         assert!(ca.requires_confirmation("click"));
         assert!(ca.requires_confirmation("fill"));
         assert!(!ca.requires_confirmation("screenshot"));
-        env::remove_var("AGENT_BROWSER_CONFIRM_ACTIONS");
     }
 }

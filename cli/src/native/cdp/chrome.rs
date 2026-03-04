@@ -22,7 +22,21 @@ impl Drop for ChromeProcess {
     fn drop(&mut self) {
         self.kill();
         if let Some(ref dir) = self.temp_user_data_dir {
-            let _ = std::fs::remove_dir_all(dir);
+            for attempt in 0..3 {
+                match std::fs::remove_dir_all(dir) {
+                    Ok(()) => break,
+                    Err(_) if attempt < 2 => {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: failed to clean up temp profile {}: {}",
+                            dir.display(),
+                            e
+                        );
+                    }
+                }
+            }
         }
     }
 }
@@ -595,6 +609,36 @@ fn expand_tilde(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard<'a> {
+        _lock: MutexGuard<'a, ()>,
+        vars: Vec<(String, Option<String>)>,
+    }
+
+    impl<'a> EnvGuard<'a> {
+        fn new(var_names: &[&str]) -> Self {
+            let lock = ENV_MUTEX.lock().unwrap();
+            let vars = var_names
+                .iter()
+                .map(|&name| (name.to_string(), std::env::var(name).ok()))
+                .collect();
+            Self { _lock: lock, vars }
+        }
+    }
+
+    impl Drop for EnvGuard<'_> {
+        fn drop(&mut self) {
+            for (name, value) in &self.vars {
+                match value {
+                    Some(v) => std::env::set_var(name, v),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_find_chrome_returns_some_on_host() {
@@ -662,10 +706,9 @@ mod tests {
 
     #[test]
     fn test_find_playwright_chromium_nonexistent() {
-        // With no Playwright cache, should return None
+        let _guard = EnvGuard::new(&["PLAYWRIGHT_BROWSERS_PATH"]);
         std::env::set_var("PLAYWRIGHT_BROWSERS_PATH", "/nonexistent/path");
         let result = find_playwright_chromium();
-        std::env::remove_var("PLAYWRIGHT_BROWSERS_PATH");
         assert!(result.is_none());
     }
 
