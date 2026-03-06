@@ -1,13 +1,127 @@
 import { spawn, ChildProcess } from "child_process";
+import * as http from "http";
 import * as net from "net";
 import * as os from "os";
 import * as path from "path";
 import * as fs from "fs";
 import { fileURLToPath } from "url";
 import { scenarios, type BenchmarkCommand, type Scenario } from "./scenarios.js";
+import { engineScenarios } from "./engine-scenarios.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// ---------------------------------------------------------------------------
+// Static file server for HTTP-served benchmarks
+// ---------------------------------------------------------------------------
+
+const PAGES_DIR = path.join(__dirname, "pages");
+
+const MIME_TYPES: Record<string, string> = {
+  ".html": "text/html",
+  ".css": "text/css",
+  ".js": "application/javascript",
+  ".json": "application/json",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".svg": "image/svg+xml",
+};
+
+function startFileServer(): Promise<{ server: http.Server; port: number }> {
+  return new Promise((resolve, reject) => {
+    const server = http.createServer((req, res) => {
+      const url = new URL(req.url || "/", `http://localhost`);
+      let filePath = path.join(PAGES_DIR, url.pathname === "/" ? "article.html" : url.pathname);
+
+      if (!filePath.startsWith(PAGES_DIR)) {
+        res.writeHead(403);
+        res.end();
+        return;
+      }
+
+      if (fs.existsSync(filePath) && fs.statSync(filePath).isDirectory()) {
+        filePath = path.join(filePath, "index.html");
+      }
+
+      try {
+        const content = fs.readFileSync(filePath);
+        const ext = path.extname(filePath);
+        res.writeHead(200, { "Content-Type": MIME_TYPES[ext] || "application/octet-stream" });
+        res.end(content);
+      } catch {
+        res.writeHead(404);
+        res.end("Not found");
+      }
+    });
+
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      if (!addr || typeof addr === "string") {
+        reject(new Error("Failed to get server address"));
+        return;
+      }
+      resolve({ server, port: addr.port });
+    });
+
+    server.on("error", reject);
+  });
+}
+
+function stopFileServer(server: http.Server): Promise<void> {
+  return new Promise((resolve) => {
+    server.close(() => resolve());
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Memory measurement via /proc or ps
+// ---------------------------------------------------------------------------
+
+function getProcessMemoryKB(pid: number): number | null {
+  if (process.platform === "linux") {
+    try {
+      const status = fs.readFileSync(`/proc/${pid}/status`, "utf-8");
+      const match = status.match(/VmRSS:\s+(\d+)\s+kB/);
+      if (match) return parseInt(match[1], 10);
+    } catch { /* */ }
+  }
+
+  try {
+    const { execSync } = require("child_process");
+    const output = execSync(`ps -o rss= -p ${pid}`, { encoding: "utf-8", timeout: 2000 });
+    const kb = parseInt(output.trim(), 10);
+    if (!isNaN(kb)) return kb;
+  } catch { /* */ }
+
+  return null;
+}
+
+function sampleMemory(pids: number[], intervalMs: number): { stop: () => number } {
+  let peakKB = 0;
+  const timer = setInterval(() => {
+    for (const pid of pids) {
+      const kb = getProcessMemoryKB(pid);
+      if (kb && kb > peakKB) peakKB = kb;
+    }
+  }, intervalMs);
+
+  return {
+    stop() {
+      clearInterval(timer);
+      for (const pid of pids) {
+        const kb = getProcessMemoryKB(pid);
+        if (kb && kb > peakKB) peakKB = kb;
+      }
+      return peakKB;
+    },
+  };
+}
+
+function formatMemory(kb: number): string {
+  if (kb >= 1024 * 1024) return `${(kb / 1024 / 1024).toFixed(1)}GB`;
+  if (kb >= 1024) return `${(kb / 1024).toFixed(1)}MB`;
+  return `${kb}KB`;
+}
 
 // ---------------------------------------------------------------------------
 // Socket / daemon helpers
@@ -750,7 +864,73 @@ async function runDaemonBenchmark(args: CliArgs): Promise<void> {
   }
 }
 
+function buildHttpScenarios(baseUrl: string): Scenario[] {
+  const pages = ["article.html", "dashboard.html", "ecommerce.html"];
+  const httpScenarios: Scenario[] = [];
+
+  for (const page of pages) {
+    const label = page.replace(".html", "");
+    httpScenarios.push({
+      name: `http-${label}`,
+      description: `Navigate to ${label} page over HTTP (full fetch + parse + layout)`,
+      commands: [
+        { id: "nav", action: "navigate", url: `${baseUrl}/${page}`, waitUntil: "load" },
+      ],
+    });
+  }
+
+  httpScenarios.push({
+    name: "http-nav+snap",
+    description: "Navigate to article over HTTP then snapshot",
+    commands: [
+      { id: "nav", action: "navigate", url: `${baseUrl}/article.html`, waitUntil: "load" },
+      { id: "snap", action: "snapshot" },
+    ],
+  });
+
+  // Multi-page throughput: cycle through all pages N times
+  const multiPageCmds: BenchmarkCommand[] = [];
+  for (let round = 0; round < 5; round++) {
+    for (const page of pages) {
+      multiPageCmds.push({
+        id: `nav-${round}-${page}`,
+        action: "navigate",
+        url: `${baseUrl}/${page}`,
+        waitUntil: "load",
+      });
+    }
+  }
+  httpScenarios.push({
+    name: "http-multi-15pg",
+    description: "Navigate 15 pages in sequence (5 rounds x 3 pages)",
+    commands: multiPageCmds,
+  });
+
+  // Bulk navigation: 50 page loads of the article (closest to Lightpanda's 100-page benchmark)
+  const bulkCmds: BenchmarkCommand[] = [];
+  for (let i = 0; i < 50; i++) {
+    bulkCmds.push({
+      id: `bulk-${i}`,
+      action: "navigate",
+      url: `${baseUrl}/${pages[i % pages.length]}`,
+      waitUntil: "load",
+    });
+  }
+  httpScenarios.push({
+    name: "http-bulk-50pg",
+    description: "Navigate 50 pages sequentially (throughput test)",
+    commands: bulkCmds,
+  });
+
+  return httpScenarios;
+}
+
 async function runEngineBenchmark(args: CliArgs): Promise<void> {
+  console.log("Starting local file server...");
+  const { server, port } = await startFileServer();
+  const baseUrl = `http://127.0.0.1:${port}`;
+  console.log(`  Serving pages at ${baseUrl}`);
+
   console.log("Starting engine benchmark daemons...");
 
   let chromeHandle: DaemonHandle | undefined;
@@ -783,10 +963,28 @@ async function runEngineBenchmark(args: CliArgs): Promise<void> {
       }
     }
     console.log("  Browsers launched");
+
+    // Collect PIDs for memory sampling
+    const chromePid = chromeHandle.process.pid;
+    const lpPid = lightpandaHandle.process.pid;
+    const pidsToSample: number[] = [];
+    if (chromePid) pidsToSample.push(chromePid);
+    if (lpPid) pidsToSample.push(lpPid);
+
+    const memSampler = pidsToSample.length > 0
+      ? sampleMemory(pidsToSample, 500)
+      : null;
+
+    // Measure per-engine peak memory during the heavy scenarios
+    const chromeMemPids = chromePid ? [chromePid] : [];
+    const lpMemPids = lpPid ? [lpPid] : [];
+
     console.log("");
 
+    const httpScenarios = buildHttpScenarios(baseUrl);
+    const allScenarios = [...scenarios, ...engineScenarios, ...httpScenarios];
     const results: ScenarioResult[] = [];
-    for (const scenario of scenarios) {
+    for (const scenario of allScenarios) {
       process.stdout.write(`  Running: ${scenario.name}...`);
       const result = await runScenarioWithErrorTolerance(
         scenario,
@@ -814,7 +1012,23 @@ async function runEngineBenchmark(args: CliArgs): Promise<void> {
       }
     }
 
+    // Final memory snapshot
+    const chromeMemKB = chromeMemPids.length > 0 ? getProcessMemoryKB(chromeMemPids[0]) : null;
+    const lpMemKB = lpMemPids.length > 0 ? getProcessMemoryKB(lpMemPids[0]) : null;
+    if (memSampler) memSampler.stop();
+
     printResults(results, args.iterations, args.warmup, "engine");
+
+    if (chromeMemKB || lpMemKB) {
+      console.log("Memory (daemon RSS after benchmarks):");
+      if (chromeMemKB) console.log(`  Chrome daemon:     ${formatMemory(chromeMemKB)}`);
+      if (lpMemKB) console.log(`  Lightpanda daemon: ${formatMemory(lpMemKB)}`);
+      if (chromeMemKB && lpMemKB && lpMemKB > 0) {
+        const memRatio = chromeMemKB / lpMemKB;
+        console.log(`  Ratio: chrome uses ${memRatio.toFixed(1)}x more memory`);
+      }
+      console.log("");
+    }
 
     if (args.json) {
       writeJsonResults(
@@ -832,6 +1046,7 @@ async function runEngineBenchmark(args: CliArgs): Promise<void> {
   } finally {
     if (chromeHandle) await closeDaemon(chromeHandle);
     if (lightpandaHandle) await closeDaemon(lightpandaHandle);
+    await stopFileServer(server);
   }
 }
 
