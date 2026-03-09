@@ -486,7 +486,6 @@ Priority (lowest to highest): `~/.agent-browser/config.json` < `./agent-browser.
 | [references/video-recording.md](references/video-recording.md) | Recording workflows for debugging and documentation |
 | [references/profiling.md](references/profiling.md) | Chrome DevTools profiling for performance analysis |
 | [references/proxy-support.md](references/proxy-support.md) | Proxy configuration, geo-testing, rotating proxies |
-| [references/next-integration.md](references/next-integration.md) | Next.js server actions, Vercel Sandbox, cron workflows |
 
 ## Experimental: Native Mode
 

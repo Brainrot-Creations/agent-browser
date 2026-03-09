@@ -270,7 +270,7 @@ export default function Home() {
 
       <div className="space-y-1.5">
         <Label className="text-[11px] text-muted-foreground uppercase tracking-wider">
-          Runtime
+          Environment
         </Label>
         <div className="space-y-2">
           <ModeCard
@@ -416,11 +416,11 @@ export default function Home() {
             </span>
             <span className="text-muted-foreground text-sm hidden sm:inline">/</span>
             <span className="text-sm text-muted-foreground hidden sm:inline">
-              Next.js Example
+              Environments
             </span>
           </div>
           <a
-            href="https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fvercel-labs%2Fagent-browser%2Ftree%2Fmain%2Fexamples%2Fnext&env=CHROMIUM_PATH&envDescription=Optional%20path%20to%20Chromium%20binary.%20Not%20needed%20on%20Vercel.&envLink=https%3A%2F%2Fgithub.com%2Fvercel-labs%2Fagent-browser%2Ftree%2Fmain%2Fexamples%2Fnext%23environment-variables&project-name=agent-browser-app&repository-name=agent-browser-app"
+            href="https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fagent-browser%2Fagent-browser%2Ftree%2Fmain%2Fexamples%2Fenvironments&env=CHROMIUM_PATH&envDescription=Optional%20path%20to%20Chromium%20binary.%20Not%20needed%20on%20Vercel.&envLink=https%3A%2F%2Fgithub.com%2Fagent-browser%2Fagent-browser%2Ftree%2Fmain%2Fexamples%2Fenvironments%23environment-variables&project-name=agent-browser-app&repository-name=agent-browser-app"
             target="_blank"
             rel="noopener noreferrer"
           >

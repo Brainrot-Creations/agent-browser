@@ -744,7 +744,7 @@ const res = await fetch(`${process.env.AGENT_BROWSER_API_URL}/api/run`, {
 });
 ```
 
-See the [Next.js + Vercel guide](https://agent-browser.dev/next) and [`examples/next/`](examples/next/) for full setup, Dockerfile, and snapshot optimization.
+See the [environments example](examples/environments/) for a playground that demonstrates running agent-browser in different compute environments (serverless functions, Vercel Sandbox, and more).
 
 ### Serverless (AWS Lambda)
 
