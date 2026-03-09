@@ -891,12 +891,14 @@ export class BrowserManager {
   /**
    * Close a Kernel session via API
    */
-  private async closeKernelSession(sessionId: string, apiKey: string): Promise<void> {
+  private async closeKernelSession(sessionId: string, apiKey: string | undefined): Promise<void> {
+    const headers: Record<string, string> = {};
+    if (apiKey) {
+      headers['Authorization'] = `Bearer ${apiKey}`;
+    }
     const response = await fetch(`https://api.onkernel.com/browsers/${sessionId}`, {
       method: 'DELETE',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-      },
+      headers,
     });
 
     if (!response.ok) {
@@ -974,16 +976,19 @@ export class BrowserManager {
    */
   private async findOrCreateKernelProfile(
     profileName: string,
-    apiKey: string
+    apiKey: string | undefined
   ): Promise<{ name: string }> {
+    const headers: Record<string, string> = {};
+    if (apiKey) {
+      headers['Authorization'] = `Bearer ${apiKey}`;
+    }
+
     // First, try to get the existing profile
     const getResponse = await fetch(
       `https://api.onkernel.com/profiles/${encodeURIComponent(profileName)}`,
       {
         method: 'GET',
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-        },
+        headers,
       }
     );
 
@@ -1001,7 +1006,7 @@ export class BrowserManager {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
+        ...headers,
       },
       body: JSON.stringify({ name: profileName }),
     });
@@ -1015,13 +1020,13 @@ export class BrowserManager {
 
   /**
    * Connect to Kernel remote browser via CDP.
-   * Requires KERNEL_API_KEY environment variable.
+   * Uses KERNEL_API_KEY environment variable for authentication when set.
+   * When running inside environments with external credential injection
+   * (e.g. Vercel Sandbox credentials brokering), the API key can be omitted
+   * and auth headers will be injected at the network layer.
    */
   private async connectToKernel(): Promise<void> {
     const kernelApiKey = process.env.KERNEL_API_KEY;
-    if (!kernelApiKey) {
-      throw new Error('KERNEL_API_KEY is required when using kernel as a provider');
-    }
 
     // Find or create profile if KERNEL_PROFILE_NAME is set
     const profileName = process.env.KERNEL_PROFILE_NAME;
@@ -1037,12 +1042,16 @@ export class BrowserManager {
       };
     }
 
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    if (kernelApiKey) {
+      headers['Authorization'] = `Bearer ${kernelApiKey}`;
+    }
+
     const response = await fetch('https://api.onkernel.com/browsers', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${kernelApiKey}`,
-      },
+      headers,
       body: JSON.stringify({
         // Kernel browsers are headful by default with stealth mode available
         // The user can configure these via environment variables if needed
@@ -1093,7 +1102,7 @@ export class BrowserManager {
       }
 
       this.kernelSessionId = session.session_id;
-      this.kernelApiKey = kernelApiKey;
+      this.kernelApiKey = kernelApiKey ?? null;
       this.browser = browser;
       context.setDefaultTimeout(getDefaultTimeout());
       this.contexts.push(context);
@@ -2513,8 +2522,8 @@ export class BrowserManager {
         }
       );
       this.browser = null;
-    } else if (this.kernelSessionId && this.kernelApiKey) {
-      await this.closeKernelSession(this.kernelSessionId, this.kernelApiKey).catch((error) => {
+    } else if (this.kernelSessionId) {
+      await this.closeKernelSession(this.kernelSessionId, this.kernelApiKey ?? undefined).catch((error) => {
         console.error('Failed to close Kernel session:', error);
       });
       this.browser = null;
