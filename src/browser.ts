@@ -19,6 +19,7 @@ import os from 'node:os';
 import { existsSync, mkdirSync, rmSync, readFileSync, statSync } from 'node:fs';
 import { writeFile, mkdir } from 'node:fs/promises';
 import type { LaunchCommand, TraceEvent } from './types.js';
+import type { InspectServer } from './inspect-server.js';
 import { type RefMap, type EnhancedSnapshot, getEnhancedSnapshot, parseRef } from './snapshot.js';
 import { safeHeaderMerge } from './state-utils.js';
 import { isDomainAllowed, installDomainFilter, parseDomainList } from './domain-filter.js';
@@ -119,6 +120,7 @@ export class BrowserManager {
   private colorScheme: 'light' | 'dark' | 'no-preference' | null = null;
   private downloadPath: string | null = null;
   private allowedDomains: string[] = [];
+  inspectServer: InspectServer | null = null;
 
   /**
    * Set the persistent color scheme preference.
@@ -169,10 +171,16 @@ export class BrowserManager {
 
   getCdpUrl(): string | null {
     if (this.cdpEndpoint) {
-      return this.cdpEndpoint;
+      try {
+        const ws = (this.browser as any)?.wsEndpoint?.();
+        if (ws) return ws;
+      } catch {}
+      if (this.cdpEndpoint.startsWith('ws://') || this.cdpEndpoint.startsWith('wss://')) {
+        return this.cdpEndpoint;
+      }
+      return null;
     }
     try {
-      // wsEndpoint() exists on chromium Browser instances but isn't in Playwright's public types
       return (this.browser as any)?.wsEndpoint?.() ?? null;
     } catch {
       return null;
@@ -2483,6 +2491,11 @@ export class BrowserManager {
    * Close the browser and clean up
    */
   async close(): Promise<void> {
+    if (this.inspectServer) {
+      this.inspectServer.stop();
+      this.inspectServer = null;
+    }
+
     // Stop recording if active (saves video)
     if (this.recordingContext) {
       await this.stopRecording();

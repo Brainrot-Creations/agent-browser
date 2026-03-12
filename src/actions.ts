@@ -1068,10 +1068,6 @@ async function handleClose(
   command: Command & { action: 'close' },
   browser: BrowserManager
 ): Promise<Response> {
-  if (inspectServerInstance) {
-    inspectServerInstance.stop();
-    inspectServerInstance = null;
-  }
   await browser.close();
   return successResponse(command.id, { closed: true });
 }
@@ -1594,8 +1590,6 @@ function handleCdpUrl(command: Command & { action: 'cdp_url' }, browser: Browser
   return successResponse(command.id, { cdpUrl });
 }
 
-let inspectServerInstance: import('./inspect-server.js').InspectServer | null = null;
-
 async function handleInspect(
   command: Command & { action: 'inspect' },
   browser: BrowserManager
@@ -1606,12 +1600,12 @@ async function handleInspect(
   }
 
   // Shut down any existing inspect server so we always target the current page
-  if (inspectServerInstance) {
-    inspectServerInstance.stop();
-    inspectServerInstance = null;
+  if (browser.inspectServer) {
+    browser.inspectServer.stop();
+    browser.inspectServer = null;
   }
 
-  const stripped = cdpUrl.replace(/^wss?:\/\//, '');
+  const stripped = cdpUrl.replace(/^(wss?|https?):\/\//, '');
   const hostPort = stripped.split('/')[0];
 
   // Get the target ID so the inspect server can create its own dedicated CDP session
@@ -1622,7 +1616,9 @@ async function handleInspect(
   try {
     const info: any = await tmpCdp.send('Target.getTargetInfo' as any);
     targetId = info?.targetInfo?.targetId || '';
-  } catch {}
+  } catch (err) {
+    console.error('[inspect] getTargetInfo failed:', err);
+  }
   await tmpCdp.detach();
 
   if (!targetId) {
@@ -1636,7 +1632,7 @@ async function handleInspect(
     chromeWsUrl: cdpUrl,
   });
   await server.start();
-  inspectServerInstance = server;
+  browser.inspectServer = server;
 
   const url = `http://127.0.0.1:${server.port}`;
   openUrlInBrowser(url);

@@ -225,7 +225,19 @@ async fn handle_ws_proxy(
 
     // Chrome -> DevTools: forward messages matching our session, strip sessionId
     let mut chrome_to_devtools = tokio::spawn(async move {
-        while let Ok(raw_msg) = raw_rx.recv().await {
+        loop {
+            let raw_msg = match raw_rx.recv().await {
+                Ok(msg) => msg,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    eprintln!(
+                        "[inspect] warning: dropped {} CDP messages (channel lag)",
+                        n
+                    );
+                    continue;
+                }
+                Err(_) => break,
+            };
+
             if raw_msg.session_id.as_deref() != Some(&session_id_clone) {
                 continue;
             }
@@ -278,14 +290,14 @@ async fn handle_ws_proxy(
 }
 
 fn inject_session_id(json: &str, session_id: &str) -> String {
-    if let Some(pos) = json.find('{') {
-        let mut result = String::with_capacity(json.len() + session_id.len() + 20);
-        result.push_str(&json[..=pos]);
-        result.push_str("\"sessionId\":\"");
-        result.push_str(session_id);
-        result.push_str("\",");
-        result.push_str(&json[pos + 1..]);
-        result
+    if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(json) {
+        if let Some(obj) = val.as_object_mut() {
+            obj.insert(
+                "sessionId".to_string(),
+                serde_json::Value::String(session_id.to_string()),
+            );
+        }
+        serde_json::to_string(&val).unwrap_or_else(|_| json.to_string())
     } else {
         json.to_string()
     }
@@ -310,15 +322,35 @@ mod tests {
     fn test_inject_session_id() {
         let input = r#"{"id":1,"method":"DOM.getDocument"}"#;
         let result = inject_session_id(input, "abc123");
-        assert!(result.contains("\"sessionId\":\"abc123\""));
-        assert!(result.contains("\"method\":\"DOM.getDocument\""));
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("valid JSON");
+        assert_eq!(parsed["sessionId"], "abc123");
+        assert_eq!(parsed["method"], "DOM.getDocument");
+        assert_eq!(parsed["id"], 1);
+    }
+
+    #[test]
+    fn test_inject_session_id_empty_object() {
+        let result = inject_session_id("{}", "abc");
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("valid JSON");
+        assert_eq!(parsed["sessionId"], "abc");
     }
 
     #[test]
     fn test_strip_session_id() {
         let input = r#"{"id":1,"result":{},"sessionId":"abc123"}"#;
         let result = strip_session_id(input);
-        assert!(!result.contains("sessionId"));
-        assert!(result.contains("\"id\":1"));
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("valid JSON");
+        assert!(parsed.get("sessionId").is_none());
+        assert_eq!(parsed["id"], 1);
+    }
+
+    #[test]
+    fn test_inject_then_strip_roundtrip() {
+        let input = r#"{"id":42,"method":"Runtime.evaluate"}"#;
+        let injected = inject_session_id(input, "sess1");
+        let stripped = strip_session_id(&injected);
+        let original: serde_json::Value = serde_json::from_str(input).unwrap();
+        let result: serde_json::Value = serde_json::from_str(&stripped).unwrap();
+        assert_eq!(original, result);
     }
 }
