@@ -2739,6 +2739,13 @@ mod tests {
     }
 
     #[test]
+    fn test_screenshot_full_page_shorthand() {
+        let cmd = parse_command(&args("screenshot -f"), &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "screenshot");
+        assert_eq!(cmd["fullPage"], true);
+    }
+
+    #[test]
     fn test_screenshot_with_ref() {
         let cmd = parse_command(&args("screenshot @e1"), &default_flags()).unwrap();
         assert_eq!(cmd["action"], "screenshot");
@@ -3604,6 +3611,17 @@ mod tests {
     fn test_diff_screenshot_command_full_flag() {
         let cmd = parse_command(
             &args("diff screenshot --baseline b.png --full"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["action"], "diff_screenshot");
+        assert_eq!(cmd["fullPage"], true);
+    }
+
+    #[test]
+    fn test_diff_screenshot_command_full_flag_shorthand() {
+        let cmd = parse_command(
+            &args("diff screenshot --baseline b.png -f"),
             &default_flags(),
         )
         .unwrap();
