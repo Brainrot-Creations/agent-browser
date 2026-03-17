@@ -2325,9 +2325,14 @@ async fn handle_diff_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Va
         selector,
         ..SnapshotOptions::default()
     };
-    let current =
-        snapshot::take_snapshot(&mgr.client, &session_id, &options, &mut state.ref_map, None)
-            .await?;
+    let current = snapshot::take_snapshot(
+        &mgr.client,
+        &session_id,
+        &options,
+        &mut state.ref_map,
+        state.active_frame_id.as_deref(),
+    )
+    .await?;
 
     let baseline = cmd.get("baseline").and_then(|v| v.as_str());
 
@@ -3523,7 +3528,7 @@ async fn handle_frame(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
                     "Runtime.callFunctionOn",
                     Some(json!({
                         "objectId": object_id,
-                        "functionDeclaration": "function() { if (this.tagName === 'IFRAME' || this.tagName === 'FRAME') { return this.name || this.id || 'frame'; } return null; }",
+                        "functionDeclaration": "function() { if (this.tagName === 'IFRAME' || this.tagName === 'FRAME') { return this.name || this.id || this.src || null; } return null; }",
                         "returnByValue": true,
                     })),
                     Some(&session_id),
@@ -3553,7 +3558,7 @@ async fn handle_frame(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
                 const el = document.querySelector({});
                 if (!el) return null;
                 if (el.tagName === 'IFRAME' || el.tagName === 'FRAME') {{
-                    return el.name || el.id || 'frame';
+                    return el.name || el.id || el.src || null;
                 }}
                 return null;
             }})()"#,
