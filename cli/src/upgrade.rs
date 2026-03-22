@@ -151,6 +151,8 @@ fn run_upgrade_command(method: &InstallMethod) -> bool {
             &["add", "-g", "agent-browser@latest"],
             "pnpm add -g agent-browser@latest",
         ),
+        // NOTE: `yarn global` is Yarn Classic (v1) only; Yarn Berry (v2+) removed it.
+        // Users on Yarn v2+ won't reach this path — detection falls through to Unknown.
         InstallMethod::Yarn => (
             "yarn",
             &["global", "add", "agent-browser@latest"],
