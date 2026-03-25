@@ -2236,6 +2236,7 @@ mod tests {
             user_agent: None,
             provider: None,
             ignore_https_errors: false,
+            ca_cert: None,
             allow_file_access: false,
             device: None,
             auto_connect: false,

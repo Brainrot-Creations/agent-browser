@@ -79,6 +79,9 @@ fn validate_lightpanda_options(options: &LaunchOptions) -> Result<(), String> {
     if !options.headless {
         return Err("Headed mode is not supported with Lightpanda (headless only)".to_string());
     }
+    if options.ca_cert.is_some() {
+        return Err("--ca-cert is not supported with Lightpanda (Chromium only)".to_string());
+    }
     if !options.args.is_empty() {
         return Err(
             "Custom Chrome arguments (--args) are not supported with Lightpanda".to_string(),
@@ -180,14 +183,6 @@ impl BrowserProcess {
             BrowserProcess::Lightpanda(p) => p.kill(),
         }
     }
-
-    /// Non-blocking check whether the browser process has exited.
-    pub fn has_exited(&mut self) -> bool {
-        match self {
-            BrowserProcess::Chrome(p) => p.has_exited(),
-            BrowserProcess::Lightpanda(_) => false,
-        }
-    }
 }
 
 pub struct BrowserManager {
@@ -197,8 +192,6 @@ pub struct BrowserManager {
     pages: Vec<PageInfo>,
     active_page_index: usize,
     default_timeout_ms: u64,
-    /// Stored download path from launch options, re-applied to new contexts (e.g., recording)
-    pub download_path: Option<String>,
 }
 
 const LIGHTPANDA_CDP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -267,7 +260,6 @@ impl BrowserManager {
                 pages: Vec::new(),
                 active_page_index: 0,
                 default_timeout_ms: 25_000,
-                download_path: download_path.clone(),
             };
             manager.discover_and_attach_targets().await?;
             manager
@@ -332,7 +324,6 @@ impl BrowserManager {
             pages: Vec::new(),
             active_page_index: 0,
             default_timeout_ms: 10_000,
-            download_path: None, // CDP connections don't have a launch-time download path
         };
 
         manager.discover_and_attach_targets().await?;
@@ -648,17 +639,6 @@ impl BrowserManager {
         match result {
             Ok(Ok(_)) => true,
             Ok(Err(_)) | Err(_) => false,
-        }
-    }
-
-    /// Non-blocking check whether the locally-launched browser process has exited
-    /// (crashed or terminated). Also reaps the zombie if it has exited.
-    /// Returns false for external CDP connections (no child process to monitor).
-    pub fn has_process_exited(&mut self) -> bool {
-        if let Some(ref mut process) = self.browser_process {
-            process.has_exited()
-        } else {
-            false
         }
     }
 
@@ -1275,7 +1255,6 @@ async fn initialize_lightpanda_manager(
             pages: Vec::new(),
             active_page_index: 0,
             default_timeout_ms: 25_000,
-            download_path: None,
         };
 
         match discover_and_attach_lightpanda_targets(&mut manager, deadline).await {

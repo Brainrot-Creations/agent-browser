@@ -993,11 +993,9 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
             | "device_list"
     );
     if !skip_launch {
-        // Check if existing connection is stale and needs re-launch.
-        // First do a fast, non-blocking check: did the browser process crash/exit?
-        // This avoids a 3-second CDP timeout when Chrome is already dead.
-        let needs_launch = if let Some(ref mut mgr) = state.browser {
-            mgr.has_process_exited() || !mgr.is_connection_alive().await
+        // Check if existing connection is stale and needs re-launch
+        let needs_launch = if let Some(ref mgr) = state.browser {
+            !mgr.is_connection_alive().await
         } else {
             true
         };
@@ -1076,7 +1074,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         "setcontent" => handle_setcontent(cmd, state).await,
         "headers" => handle_headers(cmd, state).await,
         "offline" => handle_offline(cmd, state).await,
-        "console" => handle_console(cmd, state).await,
+        "console" => handle_console(state).await,
         "errors" => handle_errors(state).await,
         "state_save" => handle_state_save(cmd, state).await,
         "state_load" => handle_state_load(cmd, state).await,
@@ -1323,6 +1321,7 @@ fn launch_options_from_env() -> LaunchOptions {
         ignore_https_errors: env::var("AGENT_BROWSER_IGNORE_HTTPS_ERRORS")
             .map(|v| v == "1" || v == "true")
             .unwrap_or(false),
+        ca_cert: env::var("AGENT_BROWSER_CA_CERT").ok(),
         color_scheme: env::var("AGENT_BROWSER_COLOR_SCHEME").ok(),
         download_path: env::var("AGENT_BROWSER_DOWNLOAD_PATH").ok(),
     }
@@ -1358,12 +1357,11 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    // Relaunch logic: check if we can reuse the existing connection.
-    // Fast process-exit check first to avoid expensive CDP timeout.
-    let needs_relaunch = if let Some(ref mut mgr) = state.browser {
+    // Relaunch logic: check if we can reuse the existing connection
+    let needs_relaunch = if let Some(ref mgr) = state.browser {
         let is_external = cdp_url.is_some() || cdp_port.is_some() || auto_connect;
         let was_external = mgr.is_cdp_connection();
-        is_external != was_external || mgr.has_process_exited() || !mgr.is_connection_alive().await
+        is_external != was_external || !mgr.is_connection_alive().await
     } else {
         true
     };
@@ -1529,6 +1527,11 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
             .get("ignoreHTTPSErrors")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
+        ca_cert: cmd
+            .get("caCert")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .or_else(|| env::var("AGENT_BROWSER_CA_CERT").ok()),
         color_scheme: cmd
             .get("colorScheme")
             .and_then(|v| v.as_str())
@@ -2887,15 +2890,8 @@ async fn handle_offline(cmd: &Value, state: &DaemonState) -> Result<Value, Strin
     Ok(json!({ "offline": offline }))
 }
 
-async fn handle_console(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let clear = cmd.get("clear").and_then(|v| v.as_bool()).unwrap_or(false);
-    if clear {
-        state.event_tracker.clear_console();
-        Ok(json!({ "cleared": true }))
-    } else {
-        let result = state.event_tracker.get_console_json();
-        Ok(result)
-    }
+async fn handle_console(state: &DaemonState) -> Result<Value, String> {
+    Ok(state.event_tracker.get_console_json())
 }
 
 async fn handle_errors(state: &DaemonState) -> Result<Value, String> {
@@ -3121,33 +3117,6 @@ async fn handle_mouse(cmd: &Value, state: &DaemonState) -> Result<Value, String>
 async fn handle_keyboard(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
-
-    match cmd.get("subaction").and_then(|v| v.as_str()) {
-        Some("type") => {
-            let text = cmd
-                .get("text")
-                .and_then(|v| v.as_str())
-                .ok_or("Missing 'text' parameter")?;
-            interaction::type_text_into_active_context(&mgr.client, &session_id, text, None)
-                .await?;
-            return Ok(json!({ "typed": text }));
-        }
-        Some("insertText") => {
-            let text = cmd
-                .get("text")
-                .and_then(|v| v.as_str())
-                .ok_or("Missing 'text' parameter")?;
-            mgr.client
-                .send_command(
-                    "Input.insertText",
-                    Some(json!({ "text": text })),
-                    Some(&session_id),
-                )
-                .await?;
-            return Ok(json!({ "inserted": true }));
-        }
-        _ => {}
-    }
 
     let event_type = cmd
         .get("eventType")
@@ -3525,25 +3494,6 @@ async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<
 
         let new_session_id = attach_result.session_id.clone();
         mgr.enable_domains_pub(&new_session_id).await?;
-
-        // Re-apply download behavior to the recording context.
-        // Without this, downloads in the recording context are silently dropped
-        // because Browser.setDownloadBehavior at launch only applies to the default context.
-        if let Some(ref dl_path) = mgr.download_path {
-            let _ = mgr
-                .client
-                .send_command(
-                    "Browser.setDownloadBehavior",
-                    Some(json!({
-                        "behavior": "allow",
-                        "downloadPath": dl_path,
-                        "browserContextId": context_id,
-                        "eventsEnabled": true
-                    })),
-                    None,
-                )
-                .await;
-        }
 
         // Transfer cookies to new context
         if let Some(ref cr) = cookies_result {

@@ -430,12 +430,11 @@ pub fn print_response_with_opts(resp: &Response, action: Option<&str>, opts: &Ou
             }
             return;
         }
-        // Cleared (cookies, console, or request log)
+        // Cleared (cookies or request log)
         if let Some(cleared) = data.get("cleared").and_then(|v| v.as_bool()) {
             if cleared {
                 let label = match action {
                     Some("cookies_clear") => "Cookies cleared",
-                    Some("console") => "Console log cleared",
                     _ => "Request log cleared",
                 };
                 println!("{} {}", color::success_indicator(), label);
@@ -2690,6 +2689,8 @@ Options:
   --proxy-bypass <hosts>     Bypass proxy for these hosts (or AGENT_BROWSER_PROXY_BYPASS, NO_PROXY)
                              e.g., --proxy-bypass "localhost,*.internal.com"
   --ignore-https-errors      Ignore HTTPS certificate errors
+  --ca-cert <path>           Trust a specific CA certificate for HTTPS interception proxies
+                             (or AGENT_BROWSER_CA_CERT). Computes SPKI hash for Chromium.
   --allow-file-access        Allow file:// URLs to access local files (Chromium only)
   -p, --provider <name>      Browser provider: ios, browserbase, kernel, browseruse, browserless
   --device <name>            iOS device name (e.g., "iPhone 15 Pro")
@@ -2745,6 +2746,7 @@ Environment:
   AGENT_BROWSER_ANNOTATE         Annotated screenshot with numbered labels and legend
   AGENT_BROWSER_DEBUG            Debug output
   AGENT_BROWSER_IGNORE_HTTPS_ERRORS Ignore HTTPS certificate errors
+  AGENT_BROWSER_CA_CERT          Path to CA certificate to trust (HTTPS interception proxies)
   AGENT_BROWSER_PROVIDER         Browser provider (ios, browserbase, kernel, browseruse, browserless)
   AGENT_BROWSER_AUTO_CONNECT     Auto-discover and connect to running Chrome
   AGENT_BROWSER_ALLOW_FILE_ACCESS Allow file:// URLs to access local files
