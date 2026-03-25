@@ -110,6 +110,7 @@ See [references/authentication.md](references/authentication.md) for OAuth, 2FA,
 # Navigation
 agent-browser open <url>              # Navigate (aliases: goto, navigate)
 agent-browser close                   # Close browser
+agent-browser close --all             # Close all active sessions
 
 # Snapshot
 agent-browser snapshot -i             # Interactive elements with refs (recommended)
@@ -578,9 +579,10 @@ Always close your browser session when done to avoid leaked processes:
 ```bash
 agent-browser close                    # Close default session
 agent-browser --session agent1 close   # Close specific session
+agent-browser close --all              # Close all active sessions
 ```
 
-If a previous session was not closed properly, the daemon may still be running. Use `agent-browser close` to clean it up before starting new work.
+If a previous session was not closed properly, the daemon may still be running. Use `agent-browser close` to clean it up, or `agent-browser close --all` to shut down every session at once.
 
 To auto-shutdown the daemon after a period of inactivity (useful for ephemeral/CI environments):
 
@@ -714,21 +716,23 @@ Lightpanda does not support `--extension`, `--profile`, `--state`, or `--allow-f
 
 ## Observability Dashboard
 
-Use `--observe` to enable a live web dashboard for debugging sessions. It shows the browser viewport, command activity, and console output in real time.
+The dashboard is a standalone background server that shows live browser viewports, command activity, and console output for all sessions.
 
 ```bash
 # Install the dashboard once
 agent-browser dashboard install
 
-# Start a session with the dashboard enabled
-agent-browser --observe open example.com
-# Open http://localhost:9223 in your browser
+# Start the dashboard server (background, port 4848)
+agent-browser dashboard start
 
-# Custom port
-agent-browser --observe 9224 open example.com
+# Start sessions with --observe to stream to the dashboard
+agent-browser --observe open example.com
+
+# Stop the dashboard
+agent-browser dashboard stop
 ```
 
-The dashboard is opt-in and served from `~/.agent-browser/dashboard/`. It connects via WebSocket on the stream port.
+The dashboard runs independently of browser sessions on port 4848 (configurable with `--port`). Sessions must use `--observe` to enable WebSocket streaming.
 
 ## Ready-to-Use Templates
 

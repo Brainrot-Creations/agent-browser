@@ -1596,11 +1596,14 @@ Examples:
             r##"
 agent-browser close - Close the browser
 
-Usage: agent-browser close
+Usage: agent-browser close [options]
 
 Closes the browser instance for the current session.
 
 Aliases: quit, exit
+
+Options:
+  --all                Close all active sessions
 
 Global Options:
   --json               Output as JSON
@@ -1609,6 +1612,7 @@ Global Options:
 Examples:
   agent-browser close
   agent-browser close --session mysession
+  agent-browser close --all
 "##
         }
 
@@ -2393,20 +2397,34 @@ Examples:
             r##"
 agent-browser dashboard - Observability dashboard
 
-Usage: agent-browser dashboard install
+Usage: agent-browser dashboard [start|stop|install] [options]
 
-Downloads and installs the observability dashboard, a local web UI that
-shows a live browser viewport and command activity feed.
+Manage the observability dashboard, a local web UI that shows live
+browser viewports and command activity feeds for all sessions.
 
 Subcommands:
+  start [--port <n>]   Start the dashboard server (default port: 4848)
+  stop                 Stop the dashboard server
   install              Download and install the dashboard to ~/.agent-browser/dashboard/
 
-After installing, use --observe to start a session with the dashboard:
-  agent-browser --observe open example.com
-  # Then open http://localhost:9223 in your browser
+Running 'agent-browser dashboard' with no subcommand is equivalent to 'dashboard start'.
+
+The dashboard runs as a standalone background process, independent of
+browser sessions. Sessions must be started with --observe to enable
+streaming to the dashboard.
+
+Options:
+  --port <n>           Port for the dashboard server (default: 4848)
+
+Global Options:
+  --json               Output as JSON
 
 Examples:
   agent-browser dashboard install
+  agent-browser dashboard start
+  agent-browser dashboard start --port 8080
+  agent-browser dashboard stop
+  agent-browser --observe open example.com
 "##
         }
 
@@ -2674,7 +2692,7 @@ Core Commands:
   snapshot                   Accessibility tree with refs (for AI)
   eval <js>                  Run JavaScript
   connect <port|url>         Connect to browser via CDP
-  close                      Close browser
+  close [--all]              Close browser (--all closes every session)
 
 Navigation:
   back                       Go back
@@ -2750,6 +2768,11 @@ Confirmation:
 Sessions:
   session                    Show current session name
   session list               List active sessions
+
+Dashboard:
+  dashboard [start]          Start the dashboard server (default port: 4848)
+  dashboard start --port <n> Start on a specific port
+  dashboard stop             Stop the dashboard server
 
 Setup:
   install                    Install browser binaries

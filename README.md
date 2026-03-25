@@ -129,6 +129,7 @@ agent-browser stream enable [--port <port>]  # Start runtime WebSocket streaming
 agent-browser stream status           # Show runtime streaming state and bound port
 agent-browser stream disable          # Stop runtime WebSocket streaming
 agent-browser close                   # Close browser (aliases: quit, exit)
+agent-browser close --all             # Close all active sessions
 ```
 
 ### Get Info
@@ -605,20 +606,23 @@ Monitor agent-browser sessions in real time with a local web dashboard showing a
 # Install the dashboard (one time)
 agent-browser dashboard install
 
-# Run any command with --observe to enable the dashboard
-agent-browser --observe open example.com
-# Open http://localhost:9223 in your browser
+# Start the dashboard server (runs in background on port 4848)
+agent-browser dashboard start
+agent-browser dashboard start --port 8080   # Custom port
 
-# Use a custom port
-agent-browser --observe 9224 open example.com
+# Run sessions with --observe to enable streaming to the dashboard
+agent-browser --observe open example.com
+
+# Stop the dashboard
+agent-browser dashboard stop
 ```
 
-The dashboard connects via WebSocket to the daemon's stream port and displays:
+The dashboard runs as a standalone background process on port 4848, independent of browser sessions. It stays available even when no sessions are running. Sessions must be started with `--observe` to enable WebSocket streaming to the dashboard.
+
+The dashboard displays:
 - **Live viewport** -- real-time JPEG frames from the browser
 - **Activity feed** -- chronological command/result stream with timing and expandable details
 - **Console output** -- browser console messages (log, warn, error)
-
-Install the dashboard once with `dashboard install` -- it downloads to `~/.agent-browser/dashboard/` and is served directly by the daemon.
 
 ## Configuration
 

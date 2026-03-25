@@ -1,6 +1,6 @@
 "use client";
 
-import type { SessionInfo } from "@/hooks/useSessions";
+import type { SessionInfo } from "@/hooks/use-sessions";
 
 interface SessionPickerProps {
   sessions: SessionInfo[];
