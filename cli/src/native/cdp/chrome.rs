@@ -177,6 +177,10 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
         (dir.clone(), Some(dir))
     };
 
+    if options.ignore_https_errors {
+        args.push("--ignore-certificate-errors".to_string());
+    }
+
     if options.allow_file_access {
         args.push("--allow-file-access-from-files".to_string());
         args.push("--allow-file-access".to_string());
