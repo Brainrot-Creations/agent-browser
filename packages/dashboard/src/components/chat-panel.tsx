@@ -11,7 +11,7 @@ import { ModelSelector } from "@/components/model-selector";
 import { shikiTheme } from "@/lib/shiki-theme";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
-import { ArrowUp, Trash2, ChevronRight, ImagePlus, X, Loader } from "lucide-react";
+import { ArrowUp, Square, Trash2, ChevronRight, ImagePlus, X, Loader } from "lucide-react";
 
 const chatComponents = {
   h1: ({ node: _node, ...props }: any) => <p className="font-bold" {...props} />,
@@ -270,7 +270,7 @@ export function ChatPanel() {
     }),
   ).current;
 
-  const { messages, sendMessage, status, setMessages, error } = useChat({
+  const { messages, sendMessage, stop, status, setMessages, error } = useChat({
     chatId,
     transport,
     onError: () => setErrorDismissed(false),
@@ -653,14 +653,25 @@ export function ChatPanel() {
               >
                 <ImagePlus className="size-3.5" />
               </button>
-              <button
-                type="submit"
-                disabled={isLoading || (!input.trim() && pendingImages.length === 0)}
-                className="bg-primary text-primary-foreground rounded-full p-1 hover:bg-primary/90 transition-colors disabled:opacity-30 shrink-0"
-                aria-label="Send message"
-              >
-                <ArrowUp className="size-3" />
-              </button>
+              {isLoading ? (
+                <button
+                  type="button"
+                  onClick={() => stop()}
+                  className="bg-destructive text-destructive-foreground rounded-full p-1 hover:bg-destructive/90 transition-colors shrink-0"
+                  aria-label="Stop"
+                >
+                  <Square className="size-3" />
+                </button>
+              ) : (
+                <button
+                  type="submit"
+                  disabled={!input.trim() && pendingImages.length === 0}
+                  className="bg-primary text-primary-foreground rounded-full p-1 hover:bg-primary/90 transition-colors disabled:opacity-30 shrink-0"
+                  aria-label="Send message"
+                >
+                  <ArrowUp className="size-3" />
+                </button>
+              )}
             </div>
           </div>
         </form>

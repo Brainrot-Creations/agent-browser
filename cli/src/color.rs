@@ -1,15 +1,30 @@
-//! Color output utilities respecting NO_COLOR environment variable.
+//! Color output utilities.
 //!
-//! When the NO_COLOR environment variable is present (regardless of value),
-//! all color formatting is disabled per https://no-color.org/
+//! Colors are off by default (agent-friendly). Enable with
+//! `AGENT_BROWSER_COLOR=1` or `NO_COLOR=0`. Setting `NO_COLOR` to a
+//! truthy value (or empty) disables colors per <https://no-color.org/>.
 
 use std::env;
 use std::sync::OnceLock;
 
-/// Returns true if color output is enabled (NO_COLOR is NOT set)
+fn env_is_truthy(name: &str) -> Option<bool> {
+    env::var(name).ok().map(|val| {
+        !matches!(val.to_lowercase().as_str(), "0" | "false" | "no")
+    })
+}
+
+/// Returns true if color output is enabled.
+///
+/// Priority: `NO_COLOR` (truthy disables, falsy enables) >
+/// `AGENT_BROWSER_COLOR` (truthy enables) > default (off).
 pub fn is_enabled() -> bool {
     static COLORS_ENABLED: OnceLock<bool> = OnceLock::new();
-    *COLORS_ENABLED.get_or_init(|| env::var("NO_COLOR").is_err())
+    *COLORS_ENABLED.get_or_init(|| {
+        if let Some(no_color) = env_is_truthy("NO_COLOR") {
+            return !no_color;
+        }
+        env_is_truthy("AGENT_BROWSER_COLOR").unwrap_or(false)
+    })
 }
 
 /// Format text in red (errors)

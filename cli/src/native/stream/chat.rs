@@ -99,11 +99,9 @@ fn get_system_prompt() -> &'static str {
         }
 
         format!(
-            r#"You are an AI assistant that controls a browser through agent-browser. You can execute browser automation commands using the agent_browser tool.
+            r#"You are an AI assistant that controls a browser through agent-browser. You MUST use the agent_browser tool to execute every browser action. NEVER claim you performed an action without calling the tool. If the user asks you to do something, ALWAYS call the tool first, then describe the result.
 
-When the user asks you to do something in the browser, use the tool to execute commands.
-
-In the tool command string, pass only the CLI arguments without the `agent-browser` prefix or `--session` flag. Do not add `--json`. For example, to navigate use `open https://example.com`, not `agent-browser open https://example.com`.
+The tool can ONLY run agent-browser commands. Do not attempt to run other programs (curl, bash, node, etc.). Do not add `--session` or `--json`. Do not chain commands with `&&` or `;`. Make one tool call per command. For example: `agent-browser open https://example.com`.
 
 Keep responses concise. Execute commands proactively when the user's intent is clear.
 
@@ -114,7 +112,7 @@ The following skill references describe agent-browser capabilities in detail. Us
 }
 
 
-const CHAT_TOOLS: &str = r#"[{"type":"function","function":{"name":"agent_browser","description":"Execute an agent-browser command against the active browser session. The command string contains the CLI arguments (without the 'agent-browser' prefix or session flag).","parameters":{"type":"object","properties":{"command":{"type":"string","description":"The command to execute, e.g. 'open https://google.com' or 'snapshot -i' or 'click @e3'"}},"required":["command"]}}}]"#;
+const CHAT_TOOLS: &str = r#"[{"type":"function","function":{"name":"agent_browser","description":"Execute an agent-browser command against the active browser session.","parameters":{"type":"object","properties":{"command":{"type":"string","description":"The command to execute, e.g. 'agent-browser open https://google.com' or 'agent-browser snapshot -i' or 'agent-browser click @e3'"}},"required":["command"]}}}]"#;
 
 const COMPACT_THRESHOLD_CHARS: usize = 200_000;
 const KEEP_RECENT_MESSAGES: usize = 6;
@@ -317,14 +315,43 @@ fn enrich_tool_output(result: &str) -> String {
     .to_string()
 }
 
+const ALLOWED_COMMANDS: &[&str] = &[
+    "open", "goto", "navigate", "back", "forward", "reload",
+    "click", "dblclick", "fill", "type", "hover", "focus",
+    "check", "uncheck", "select", "drag", "upload", "download",
+    "press", "key", "keydown", "keyup", "keyboard",
+    "scroll", "scrollintoview", "scrollinto",
+    "wait", "screenshot", "pdf", "snapshot", "eval",
+    "close", "quit", "exit", "inspect",
+    "auth", "confirm", "deny", "connect",
+    "cookies", "storage", "window", "frame", "dialog",
+    "trace", "profiler", "record", "har", "network",
+    "title", "url", "console", "errors",
+    "highlight", "state", "emulate", "video",
+    "tap", "swipe", "device", "batch", "diff",
+    "find", "role", "text", "label", "placeholder", "alt",
+    "testid", "first", "last", "nth",
+    "mouse", "touchscreen", "attribute", "property",
+];
+
 async fn execute_chat_tool(session: &str, command: &str) -> String {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => return format!("Failed to resolve executable: {}", e),
     };
 
+    let single = command.split("&&").next().unwrap_or(command);
+    let single = single.split(';').next().unwrap_or(single).trim();
+    let stripped = single
+        .strip_prefix("agent-browser ")
+        .unwrap_or(single);
+    let words = shell_words_split(stripped);
+    let first_cmd = words.first().map(|s| s.as_str()).unwrap_or("");
+    if !ALLOWED_COMMANDS.contains(&first_cmd) {
+        return format!("Blocked: '{}' is not a valid agent-browser command.", first_cmd);
+    }
     let mut args: Vec<String> = vec!["--session".into(), session.into()];
-    args.extend(shell_words_split(command));
+    args.extend(words);
 
     let mut cmd = tokio::process::Command::new(&exe);
     cmd.args(&args)
