@@ -13,20 +13,27 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 import { ArrowUp, Square, Trash2, ChevronRight, ImagePlus, X, Loader, Copy, Check, Download } from "lucide-react";
 
+type ExtraProps = { node?: unknown };
+type MdImgProps = React.ImgHTMLAttributes<HTMLImageElement> & ExtraProps;
+type MdHeadingProps = React.HTMLAttributes<HTMLHeadingElement> & ExtraProps;
+type MdAnchorProps = React.AnchorHTMLAttributes<HTMLAnchorElement> & ExtraProps;
+type MdPreProps = React.HTMLAttributes<HTMLPreElement> & ExtraProps;
+type MdCodeProps = React.HTMLAttributes<HTMLElement> & ExtraProps;
+
 const chatComponents = {
-  img: ({ node: _node, src, alt, ...props }: any) => {
+  img: ({ node: _node, src, alt, ...props }: MdImgProps) => {
     if (typeof src === "string" && src.startsWith("data:image/")) {
       return <img src={src} alt={alt} className="rounded-md border border-border max-w-full my-1" {...props} />;
     }
     return null;
   },
-  h1: ({ node: _node, ...props }: any) => <p className="font-bold" {...props} />,
-  h2: ({ node: _node, ...props }: any) => <p className="font-bold" {...props} />,
-  h3: ({ node: _node, ...props }: any) => <p className="font-bold" {...props} />,
-  h4: ({ node: _node, ...props }: any) => <p className="font-bold" {...props} />,
-  h5: ({ node: _node, ...props }: any) => <p className="font-bold" {...props} />,
-  h6: ({ node: _node, ...props }: any) => <p className="font-bold" {...props} />,
-  a: ({ node: _node, href, children, ...props }: any) => (
+  h1: ({ node: _node, ...props }: MdHeadingProps) => <p className="font-bold" {...props} />,
+  h2: ({ node: _node, ...props }: MdHeadingProps) => <p className="font-bold" {...props} />,
+  h3: ({ node: _node, ...props }: MdHeadingProps) => <p className="font-bold" {...props} />,
+  h4: ({ node: _node, ...props }: MdHeadingProps) => <p className="font-bold" {...props} />,
+  h5: ({ node: _node, ...props }: MdHeadingProps) => <p className="font-bold" {...props} />,
+  h6: ({ node: _node, ...props }: MdHeadingProps) => <p className="font-bold" {...props} />,
+  a: ({ node: _node, href, children, ...props }: MdAnchorProps) => (
     <a
       href={href}
       target="_blank"
@@ -37,13 +44,13 @@ const chatComponents = {
       {children}
     </a>
   ),
-  pre: ({ node: _node, ...props }: any) => (
+  pre: ({ node: _node, ...props }: MdPreProps) => (
     <pre
       className="text-[11px] bg-background border border-border rounded-md p-2 my-1.5 whitespace-pre-wrap break-all"
       {...props}
     />
   ),
-  code: ({ className, children, node: _node, ...props }: any) => {
+  code: ({ className, children, node: _node, ...props }: MdCodeProps) => {
     if (className?.includes("language-")) {
       return <code className={className} {...props}>{children}</code>;
     }
@@ -59,6 +66,12 @@ const chatComponents = {
 };
 
 const STORAGE_PREFIX = "dashboard-chat-";
+const IMAGE_DATA_URL_RE = /data:image\/[^;]+;base64,[A-Za-z0-9+/=]+/g;
+
+function stripImagesForStorage(messages: unknown[]): unknown[] {
+  const json = JSON.stringify(messages);
+  return JSON.parse(json.replace(IMAGE_DATA_URL_RE, "[image stripped]"));
+}
 
 const SUGGESTIONS = [
   "Go to vercel.com",
@@ -381,10 +394,10 @@ export function ChatPanel() {
     scrollToBottom();
   }, [messages, visibleError, scrollToBottom]);
 
-  // Restore messages from sessionStorage when chatId changes
+  // Restore messages from localStorage when chatId changes
   useEffect(() => {
     try {
-      const stored = sessionStorage.getItem(storageKey);
+      const stored = localStorage.getItem(storageKey);
       if (stored) {
         const parsed = JSON.parse(stored);
         if (Array.isArray(parsed) && parsed.length > 0) {
@@ -398,15 +411,15 @@ export function ChatPanel() {
     setMessages([]);
   }, [chatId, storageKey, setMessages]);
 
-  // Persist messages to sessionStorage
+  // Persist messages to localStorage (strip base64 images to save space)
   useEffect(() => {
     if (isLoading) return;
     if (messages.length === 0) {
-      sessionStorage.removeItem(storageKey);
+      localStorage.removeItem(storageKey);
       return;
     }
     try {
-      sessionStorage.setItem(storageKey, JSON.stringify(messages));
+      localStorage.setItem(storageKey, JSON.stringify(stripImagesForStorage(messages)));
     } catch {
       // ignore quota
     }
@@ -480,7 +493,7 @@ export function ChatPanel() {
   const handleClear = useCallback(() => {
     setMessages([]);
     setErrorDismissed(true);
-    sessionStorage.removeItem(storageKey);
+    localStorage.removeItem(storageKey);
     requestAnimationFrame(() => inputRef.current?.focus());
   }, [setMessages, storageKey]);
 

@@ -47,14 +47,17 @@ async fn handle_dashboard_connection(
         _ => return,
     };
 
-    let first_line = std::str::from_utf8(&buf[..n])
-        .unwrap_or("")
-        .lines()
-        .next()
-        .unwrap_or("")
-        .to_string();
+    let header_str = std::str::from_utf8(&buf[..n]).unwrap_or("");
+    let first_line = header_str.lines().next().unwrap_or("").to_string();
     let method = first_line.split_whitespace().next().unwrap_or("GET");
     let path = first_line.split_whitespace().nth(1).unwrap_or("/");
+    let origin = header_str.lines().find_map(|line| {
+        if line.len() > 8 && line[..8].eq_ignore_ascii_case("origin: ") {
+            Some(line[8..].trim().to_string())
+        } else {
+            None
+        }
+    });
 
     if method == "OPTIONS" {
         let response = format!(
@@ -66,12 +69,12 @@ async fn handle_dashboard_connection(
 
     if method == "POST" && path == "/api/chat" {
         let body_str = read_post_body(&mut stream, &buf, n).await;
-        handle_chat_request(&mut stream, &body_str).await;
+        handle_chat_request(&mut stream, &body_str, origin.as_deref()).await;
         return;
     }
 
     if method == "GET" && path == "/api/models" {
-        handle_models_request(&mut stream).await;
+        handle_models_request(&mut stream, origin.as_deref()).await;
         return;
     }
 

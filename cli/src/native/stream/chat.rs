@@ -4,9 +4,15 @@ use serde_json::{json, Value};
 
 use tokio::io::AsyncWriteExt;
 
-use super::http::CORS_HEADERS;
+use super::http::cors_headers_for_origin;
 
 const DEFAULT_AI_GATEWAY_URL: &str = "https://ai-gateway.vercel.sh";
+
+static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+fn http_client() -> &'static reqwest::Client {
+    HTTP_CLIENT.get_or_init(reqwest::Client::new)
+}
 
 fn is_chat_enabled() -> bool {
     std::env::var("AI_GATEWAY_API_KEY").is_ok()
@@ -23,7 +29,11 @@ pub(super) fn chat_status_json() -> String {
     obj.to_string()
 }
 
-pub(super) async fn handle_models_request(stream: &mut tokio::net::TcpStream) {
+pub(super) async fn handle_models_request(
+    stream: &mut tokio::net::TcpStream,
+    origin: Option<&str>,
+) {
+    let cors = cors_headers_for_origin(origin);
     let gateway_url = std::env::var("AI_GATEWAY_URL")
         .unwrap_or_else(|_| DEFAULT_AI_GATEWAY_URL.to_string())
         .trim_end_matches('/')
@@ -33,7 +43,7 @@ pub(super) async fn handle_models_request(stream: &mut tokio::net::TcpStream) {
         Err(_) => {
             let body = r#"{"data":[]}"#;
             let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{CORS_HEADERS}\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{cors}\r\n",
                 body.len()
             );
             let _ = stream.write_all(resp.as_bytes()).await;
@@ -43,7 +53,7 @@ pub(super) async fn handle_models_request(stream: &mut tokio::net::TcpStream) {
     };
 
     let url = format!("{}/v1/models", gateway_url);
-    let client = reqwest::Client::new();
+    let client = http_client();
     let result = client
         .get(&url)
         .header("Authorization", format!("Bearer {}", api_key))
@@ -59,20 +69,14 @@ pub(super) async fn handle_models_request(stream: &mut tokio::net::TcpStream) {
     };
 
     let resp = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{CORS_HEADERS}\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{cors}\r\n",
         body.len()
     );
     let _ = stream.write_all(resp.as_bytes()).await;
     let _ = stream.write_all(body.as_bytes()).await;
 }
 
-const SKILL_NAMES: &[&str] = &[
-    "agent-browser",
-    "slack",
-    "electron",
-    "dogfood",
-    "agentcore",
-];
+const SKILL_NAMES: &[&str] = &["agent-browser", "slack", "electron", "dogfood", "agentcore"];
 
 /// Locate the `skills/` directory by walking up from the executable.
 /// Works for npm installs (binary in `bin/`, skills at `../skills/`) and
@@ -310,7 +314,6 @@ fn extract_image_path(text: &str) -> Option<String> {
         if has_image_extension(trimmed) && std::path::Path::new(trimmed).exists() {
             return Some(trimmed.to_string());
         }
-        // Last whitespace-delimited token ending in image extension
         for suffix in [".png", ".jpg", ".jpeg"] {
             if let Some(pos) = trimmed.to_lowercase().rfind(suffix) {
                 let end = pos + suffix.len();
@@ -320,7 +323,7 @@ fn extract_image_path(text: &str) -> Option<String> {
                     .map(|i| i + 1)
                     .unwrap_or(0);
                 let path = &candidate[start..];
-                if !path.is_empty() {
+                if !path.is_empty() && std::path::Path::new(path).exists() {
                     return Some(path.to_string());
                 }
             }
@@ -460,7 +463,7 @@ async fn execute_chat_tool(session: &str, command: &str) -> String {
     let single = command.split("&&").next().unwrap_or(command);
     let single = single.split(';').next().unwrap_or(single).trim();
     let stripped = single.strip_prefix("agent-browser ").unwrap_or(single);
-    let words = shell_words_split(stripped);
+    let words = crate::commands::shell_words_split(stripped);
 
     let mut global_flags: Vec<String> = Vec::new();
     let mut cmd_words: Vec<String> = Vec::new();
@@ -520,37 +523,6 @@ async fn execute_chat_tool(session: &str, command: &str) -> String {
         }
         Err(e) => format!("Failed to execute command: {}", e),
     }
-}
-
-fn shell_words_split(s: &str) -> Vec<String> {
-    let mut args = Vec::new();
-    let mut current = String::new();
-    let mut in_double = false;
-    let mut in_single = false;
-    let mut chars = s.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' if !in_single => {
-                if let Some(&next) = chars.peek() {
-                    chars.next();
-                    current.push(next);
-                }
-            }
-            '"' if !in_single => in_double = !in_double,
-            '\'' if !in_double => in_single = !in_single,
-            ' ' if !in_double && !in_single => {
-                if !current.is_empty() {
-                    args.push(std::mem::take(&mut current));
-                }
-            }
-            _ => current.push(c),
-        }
-    }
-    if !current.is_empty() {
-        args.push(current);
-    }
-    args
 }
 
 async fn stream_gateway_response(
@@ -691,7 +663,12 @@ async fn stream_gateway_response(
     tool_calls
 }
 
-pub(super) async fn handle_chat_request(stream: &mut tokio::net::TcpStream, body: &str) {
+pub(super) async fn handle_chat_request(
+    stream: &mut tokio::net::TcpStream,
+    body: &str,
+    origin: Option<&str>,
+) {
+    let cors = cors_headers_for_origin(origin);
     let gateway_url = std::env::var("AI_GATEWAY_URL")
         .unwrap_or_else(|_| DEFAULT_AI_GATEWAY_URL.to_string())
         .trim_end_matches('/')
@@ -701,7 +678,7 @@ pub(super) async fn handle_chat_request(stream: &mut tokio::net::TcpStream, body
         Err(_) => {
             let err = r#"{"error":"AI_GATEWAY_API_KEY not set. Set the AI_GATEWAY_API_KEY environment variable to enable AI chat."}"#;
             let resp = format!(
-                "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{CORS_HEADERS}\r\n",
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{cors}\r\n",
                 err.len()
             );
             let _ = stream.write_all(resp.as_bytes()).await;
@@ -718,7 +695,7 @@ pub(super) async fn handle_chat_request(stream: &mut tokio::net::TcpStream, body
         Err(e) => {
             let err = format!(r#"{{"error":"Invalid JSON: {}"}}"#, e);
             let resp = format!(
-                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{CORS_HEADERS}\r\n",
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{cors}\r\n",
                 err.len()
             );
             let _ = stream.write_all(resp.as_bytes()).await;
@@ -795,10 +772,11 @@ pub(super) async fn handle_chat_request(stream: &mut tokio::net::TcpStream, body
 
     let tools: Value = serde_json::from_str(CHAT_TOOLS).unwrap();
     let url = format!("{}/v1/chat/completions", gateway_url);
-    let client = reqwest::Client::new();
+    let client = http_client();
 
     let total_chars = estimate_chars(&openai_messages);
     let mut compaction_summary: Option<String> = None;
+    let mut compaction_failed = false;
     let mut keep_last_n: usize = frontend_count;
 
     if total_chars > COMPACT_THRESHOLD_CHARS && openai_messages.len() > KEEP_RECENT_MESSAGES + 2 {
@@ -806,7 +784,7 @@ pub(super) async fn handle_chat_request(stream: &mut tokio::net::TcpStream, body
         let to_summarize = &openai_messages[1..split];
 
         if let Some(summary) =
-            summarize_for_compaction(&client, &url, &api_key, &model, to_summarize).await
+            summarize_for_compaction(client, &url, &api_key, &model, to_summarize).await
         {
             let summary_msg = json!({
                 "role": "system",
@@ -822,11 +800,13 @@ pub(super) async fn handle_chat_request(stream: &mut tokio::net::TcpStream, body
                 .count();
             keep_last_n = kept_frontend;
             compaction_summary = Some(summary);
+        } else {
+            compaction_failed = true;
         }
     }
 
     let headers = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nx-vercel-ai-ui-message-stream: v1\r\n{CORS_HEADERS}\r\n"
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nx-vercel-ai-ui-message-stream: v1\r\n{cors}\r\n"
     );
     if stream.write_all(headers.as_bytes()).await.is_err() {
         return;
@@ -854,10 +834,21 @@ pub(super) async fn handle_chat_request(stream: &mut tokio::net::TcpStream, body
             })
         );
         let _ = stream.write_all(ev.as_bytes()).await;
+    } else if compaction_failed {
+        let ev = format!(
+            "data: {}\n\n",
+            json!({
+                "type": "message-metadata",
+                "messageMetadata": {
+                    "compacted": false,
+                    "warning": "Conversation is large but compaction failed. Responses may be degraded."
+                }
+            })
+        );
+        let _ = stream.write_all(ev.as_bytes()).await;
     }
 
-    let total_deadline =
-        tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+    let total_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
     const TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
     for _step in 0..50 {

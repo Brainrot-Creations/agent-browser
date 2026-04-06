@@ -2296,6 +2296,38 @@ fn parse_storage(rest: &[&str], id: &str) -> Result<Value, ParseError> {
     }
 }
 
+/// Split a string into arguments respecting shell quoting (double/single quotes, backslash escapes).
+pub fn shell_words_split(s: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_double = false;
+    let mut in_single = false;
+    let mut chars = s.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if !in_single => {
+                if let Some(&next) = chars.peek() {
+                    chars.next();
+                    current.push(next);
+                }
+            }
+            '"' if !in_single => in_double = !in_double,
+            '\'' if !in_double => in_single = !in_single,
+            ' ' if !in_double && !in_single => {
+                if !current.is_empty() {
+                    args.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        args.push(current);
+    }
+    args
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

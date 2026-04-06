@@ -15,6 +15,30 @@ use super::discovery::discover_sessions;
 
 pub(super) const CORS_HEADERS: &str = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\n";
 
+/// Build CORS headers that reflect the request origin only when it passes
+/// `is_allowed_origin`. Used for sensitive endpoints (chat, models) so the
+/// API key is not accessible from arbitrary web pages.
+pub(super) fn cors_headers_for_origin(origin: Option<&str>) -> String {
+    let allowed_origin = match origin {
+        Some(o) if super::is_allowed_origin(Some(o)) => o,
+        _ => "http://localhost",
+    };
+    format!(
+        "Access-Control-Allow-Origin: {}\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\n",
+        allowed_origin
+    )
+}
+
+fn parse_origin(peeked: &[u8]) -> Option<String> {
+    let header_str = std::str::from_utf8(peeked).ok()?;
+    for line in header_str.lines() {
+        if line.len() > 8 && line[..8].eq_ignore_ascii_case("origin: ") {
+            return Some(line[8..].trim().to_string());
+        }
+    }
+    None
+}
+
 pub(super) async fn handle_http_request(
     mut stream: tokio::net::TcpStream,
     peeked: &[u8],
@@ -31,6 +55,7 @@ pub(super) async fn handle_http_request(
     let first_line = request.lines().next().unwrap_or("");
     let method = first_line.split_whitespace().next().unwrap_or("GET");
     let path = first_line.split_whitespace().nth(1).unwrap_or("/");
+    let origin = parse_origin(peeked);
 
     if method == "OPTIONS" {
         let response = format!(
@@ -42,6 +67,18 @@ pub(super) async fn handle_http_request(
 
     if method == "POST" {
         let full_body = read_full_body(&mut stream, peeked).await;
+        if full_body.is_none()
+            && (path == "/api/chat" || path == "/api/sessions" || path == "/api/command")
+        {
+            let body = r#"{"error":"Request body too large"}"#;
+            let response = format!(
+                "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{CORS_HEADERS}\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.write_all(body.as_bytes()).await;
+            return;
+        }
         let body_str = full_body.as_deref().unwrap_or("");
 
         if path == "/api/sessions" {
@@ -87,13 +124,13 @@ pub(super) async fn handle_http_request(
         }
 
         if path == "/api/chat" {
-            handle_chat_request(&mut stream, body_str).await;
+            handle_chat_request(&mut stream, body_str, origin.as_deref()).await;
             return;
         }
     }
 
     if method == "GET" && path == "/api/models" {
-        handle_models_request(&mut stream).await;
+        handle_models_request(&mut stream, origin.as_deref()).await;
         return;
     }
 
@@ -163,11 +200,16 @@ fn parse_content_length_bytes(headers: &[u8]) -> Option<usize> {
     None
 }
 
+const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
+
 async fn read_full_body(stream: &mut tokio::net::TcpStream, peeked: &[u8]) -> Option<String> {
     let body_offset = find_header_end(peeked)?;
     let content_length = parse_content_length_bytes(&peeked[..body_offset])?;
     if content_length == 0 {
         return Some(String::new());
+    }
+    if content_length > MAX_BODY_SIZE {
+        return None;
     }
 
     let peeked_body = &peeked[body_offset..];
