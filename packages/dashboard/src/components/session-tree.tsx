@@ -403,7 +403,13 @@ export function SessionTree() {
           )}
           <button
             type="button"
-            onClick={() => setNewSessionOpen(true)}
+            onClick={() => {
+              const existing = new Set(sessions.map((s) => s.session));
+              let n = sessions.length + 1;
+              while (existing.has(`session-${n}`)) n++;
+              setNewSessionName(`session-${n}`);
+              setNewSessionOpen(true);
+            }}
             className="flex size-5 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
             title="New session"
           >

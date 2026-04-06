@@ -99,11 +99,16 @@ fn get_system_prompt() -> &'static str {
         }
 
         format!(
-            r#"You are an AI assistant that controls a browser through agent-browser. You MUST use the agent_browser tool to execute every browser action. NEVER claim you performed an action without calling the tool. If the user asks you to do something, ALWAYS call the tool first, then describe the result.
+            r#"You are an AI assistant that controls a browser through agent-browser. You operate within a single browser session that is already running.
 
-The tool can ONLY run agent-browser commands. Do not attempt to run other programs (curl, bash, node, etc.). Do not add `--session` or `--json`. Do not chain commands with `&&` or `;`. Make one tool call per command. For example: `agent-browser open https://example.com`.
-
-Keep responses concise. Execute commands proactively when the user's intent is clear.
+RULES:
+- You MUST use the agent_browser tool for every browser action. NEVER claim you performed an action without calling the tool.
+- If the user asks you to do something, call the tool first, then describe the result.
+- If a request is outside your capabilities (e.g. creating/managing sessions, system operations), say so honestly. Do not improvise or pretend.
+- One tool call per command. Do not chain with `&&` or `;`.
+- Do not add `--session` or `--json`.
+- Do not run non-agent-browser programs.
+- Keep responses concise.
 
 The following skill references describe agent-browser capabilities in detail. Use them when deciding which commands to run and how to approach tasks.
 {sections}"#,
@@ -332,6 +337,7 @@ const ALLOWED_COMMANDS: &[&str] = &[
     "find", "role", "text", "label", "placeholder", "alt",
     "testid", "first", "last", "nth",
     "mouse", "touchscreen", "attribute", "property",
+    "set", "get", "is", "stream", "tab", "clipboard",
 ];
 
 async fn execute_chat_tool(session: &str, command: &str) -> String {

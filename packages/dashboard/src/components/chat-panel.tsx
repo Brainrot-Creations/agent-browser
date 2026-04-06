@@ -11,7 +11,7 @@ import { ModelSelector } from "@/components/model-selector";
 import { shikiTheme } from "@/lib/shiki-theme";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
-import { ArrowUp, Square, Trash2, ChevronRight, ImagePlus, X, Loader } from "lucide-react";
+import { ArrowUp, Square, Trash2, ChevronRight, ImagePlus, X, Loader, Copy, Check } from "lucide-react";
 
 const chatComponents = {
   h1: ({ node: _node, ...props }: any) => <p className="font-bold" {...props} />,
@@ -234,6 +234,56 @@ function ContextMeter({ used, total }: { used: number; total: number }) {
 
 const DEFAULT_MODEL = "anthropic/claude-haiku-4.5";
 
+function useTimeAgo(ts: number | undefined) {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!ts) return;
+    const id = setInterval(() => setTick((t) => t + 1), 30_000);
+    return () => clearInterval(id);
+  }, [ts]);
+  if (!ts) return "";
+  const diff = Math.floor((Date.now() - ts) / 1000);
+  if (diff < 5) return "just now";
+  if (diff < 60) return `${diff}s ago`;
+  const mins = Math.floor(diff / 60);
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  return `${hrs}h ago`;
+}
+
+function MessageFooter({ model, timestamp, text }: { model: string; timestamp?: number; text: string }) {
+  const [copied, setCopied] = useState(false);
+  const timeAgo = useTimeAgo(timestamp);
+  const shortModel = model.includes("/") ? model.split("/").pop()! : model;
+
+  const handleCopy = useCallback(() => {
+    navigator.clipboard.writeText(text).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    });
+  }, [text]);
+
+  return (
+    <div className="flex items-center gap-2 pt-0.5 text-[10px] text-muted-foreground/50">
+      <span>{shortModel}</span>
+      {timeAgo && (
+        <>
+          <span>·</span>
+          <span>{timeAgo}</span>
+        </>
+      )}
+      <button
+        type="button"
+        onClick={handleCopy}
+        className="ml-auto hover:text-muted-foreground transition-colors"
+        aria-label="Copy message"
+      >
+        {copied ? <Check className="size-3" /> : <Copy className="size-3" />}
+      </button>
+    </div>
+  );
+}
+
 interface PendingImage {
   file: File;
   preview: string;
@@ -255,6 +305,7 @@ export function ChatPanel() {
   sessionRef.current = chatId;
   const modelRef = useRef(selectedModel);
   modelRef.current = selectedModel;
+  const messageTimestamps = useRef<Record<string, number>>({});
 
   useEffect(() => {
     if (defaultModel) setSelectedModel(defaultModel);
@@ -280,6 +331,14 @@ export function ChatPanel() {
   const isLoading = status === "streaming" || status === "submitted";
   const hasMessages = messages.length > 0 || !!visibleError;
 
+  useEffect(() => {
+    for (const msg of messages) {
+      if (msg.role === "assistant" && !messageTimestamps.current[msg.id]) {
+        messageTimestamps.current[msg.id] = Date.now();
+      }
+    }
+  }, [messages]);
+
   const models = useAtomValue(availableModelsAtom);
   const estimatedTokens = useMemo(() => {
     let total = 0;
@@ -302,6 +361,10 @@ export function ChatPanel() {
     const match = models.find((m) => m.id === selectedModel);
     return match?.context_window ?? DEFAULT_CONTEXT_WINDOW;
   }, [models, selectedModel]);
+
+  useEffect(() => {
+    inputRef.current?.focus();
+  }, []);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -532,6 +595,22 @@ export function ChatPanel() {
                         );
                       });
                     })()}
+                    {(() => {
+                      const isLast = message === messages[messages.length - 1];
+                      const isComplete = !isLast || !isLoading;
+                      if (!isComplete) return null;
+                      const fullText = message.parts
+                        .filter((p): p is Extract<typeof p, { type: "text" }> => p.type === "text" && !!p.text)
+                        .map((p) => p.text)
+                        .join("");
+                      return (
+                        <MessageFooter
+                          model={selectedModel}
+                          timestamp={messageTimestamps.current[message.id]}
+                          text={fullText}
+                        />
+                      );
+                    })()}
                   </div>
                 )}
               </div>
@@ -657,10 +736,10 @@ export function ChatPanel() {
                 <button
                   type="button"
                   onClick={() => stop()}
-                  className="bg-destructive text-destructive-foreground rounded-full p-1 hover:bg-destructive/90 transition-colors shrink-0"
+                  className="bg-primary text-primary-foreground rounded-full p-1 hover:bg-primary/90 transition-colors shrink-0"
                   aria-label="Stop"
                 >
-                  <Square className="size-3" />
+                  <Square className="size-3 fill-current" />
                 </button>
               ) : (
                 <button

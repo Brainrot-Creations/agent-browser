@@ -125,12 +125,21 @@ function parseExecError(result: ExecResult): string {
   return "";
 }
 
+const CHAT_STORAGE_PREFIX = "dashboard-chat-";
+
+function clearChatStorage(sessionName: string) {
+  try {
+    sessionStorage.removeItem(`${CHAT_STORAGE_PREFIX}${sessionName}`);
+  } catch { /* ignore */ }
+}
+
 export const closeSessionAtom = atom(null, (get, set, port: number) => {
   const sessions = get(sessionsAtom);
   const s = sessions.find((x) => x.port === port)?.session;
   if (s) {
     set(closingSessionsAtom, (prev) => new Set(prev).add(s));
     execCommand(sessionArgs(s, "close"));
+    clearChatStorage(s);
   }
 });
 
@@ -140,6 +149,7 @@ export const killSessionAtom = atom(null, (get, set, port: number) => {
   if (s) {
     set(closingSessionsAtom, (prev) => new Set(prev).add(s));
     killSession(s);
+    clearChatStorage(s);
   }
 });
 
@@ -149,6 +159,7 @@ export const closeAllSessionsAtom = atom(null, (get, set) => {
     if (!s.pending && !s.closing) {
       set(closingSessionsAtom, (prev) => new Set(prev).add(s.session));
       execCommand(sessionArgs(s.session, "close"));
+      clearChatStorage(s.session);
     }
   }
 });

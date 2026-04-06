@@ -1,7 +1,7 @@
 "use client";
 
 import { useAtomValue } from "jotai/react";
-import { activePortAtom } from "@/store/sessions";
+import { activePortAtom, sessionsAtom } from "@/store/sessions";
 import { useSessionsSync } from "@/store/sessions";
 import { useStreamSync, hasConsoleErrorsAtom, consoleLogsAtom } from "@/store/stream";
 import { useActivitySync } from "@/store/activity";
@@ -30,6 +30,8 @@ export default function DashboardPage() {
   useActivitySync();
   useChatStatusSync();
 
+  const sessions = useAtomValue(sessionsAtom);
+  const hasSessions = sessions.length > 0;
   const isDesktop = useMediaQuery("(min-width: 768px)");
   const hasConsoleErrors = useAtomValue(hasConsoleErrorsAtom);
   const activeExtensions = useAtomValue(activeExtensionsAtom);
@@ -78,6 +80,30 @@ export default function DashboardPage() {
   );
 
   if (isDesktop) {
+    if (!hasSessions) {
+      return (
+        <div className="flex h-screen flex-col bg-background">
+          <ResizablePanelGroup
+            orientation="horizontal"
+            className="min-h-0 flex-1"
+          >
+            <ResizablePanel id="sessions" defaultSize="15%" minSize="10%" maxSize="30%">
+              <SessionTree />
+            </ResizablePanel>
+            <ResizableHandle />
+            <ResizablePanel id="empty" defaultSize="85%">
+              <div className="flex h-full items-center justify-center">
+                <div className="text-center space-y-2">
+                  <p className="text-sm text-muted-foreground">No active sessions</p>
+                  <p className="text-xs text-muted-foreground/60">Create a session to get started</p>
+                </div>
+              </div>
+            </ResizablePanel>
+          </ResizablePanelGroup>
+        </div>
+      );
+    }
+
     return (
       <div className="flex h-screen flex-col bg-background">
         <ResizablePanelGroup
