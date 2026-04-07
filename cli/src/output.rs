@@ -99,6 +99,37 @@ fn format_storage_text(data: &serde_json::Value) -> Option<String> {
     Some(format!("{}: {}", key, format_storage_value(value)))
 }
 
+fn format_stream_status_text(action: Option<&str>, data: &serde_json::Value) -> Option<String> {
+    match action {
+        Some("stream_disable") => data
+            .get("disabled")
+            .and_then(|v| v.as_bool())
+            .filter(|disabled| *disabled)
+            .map(|_| "Streaming disabled".to_string()),
+        Some("stream_enable") | Some("stream_status") => {
+            let enabled = data.get("enabled").and_then(|v| v.as_bool())?;
+            if !enabled {
+                return Some("Streaming disabled".to_string());
+            }
+
+            let port = data.get("port").and_then(|v| v.as_u64())?;
+            let connected = data
+                .get("connected")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let screencasting = data
+                .get("screencasting")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            Some(format!(
+                "Streaming enabled on ws://127.0.0.1:{port}\nConnected: {connected}\nScreencasting: {screencasting}"
+            ))
+        }
+        _ => None,
+    }
+}
+
 pub fn print_response_with_opts(resp: &Response, action: Option<&str>, opts: &OutputOptions) {
     if opts.json {
         if opts.content_boundaries {
@@ -167,6 +198,10 @@ pub fn print_response_with_opts(resp: &Response, action: Option<&str>, opts: &Ou
                 print_warning(resp);
                 return;
             }
+        }
+        if let Some(output) = format_stream_status_text(action, data) {
+            println!("{}", output);
+            return;
         }
         if action == Some("storage_get") {
             if let Some(output) = format_storage_text(data) {
@@ -1508,6 +1543,7 @@ Designed for AI agents to understand page structure.
 
 Options:
   -i, --interactive    Only include interactive elements
+  -u, --urls           Include href URLs for link elements
   -c, --compact        Remove empty structural elements
   -d, --depth <n>      Limit tree depth
   -s, --selector <sel> Scope snapshot to CSS selector
@@ -1519,6 +1555,7 @@ Global Options:
 Examples:
   agent-browser snapshot
   agent-browser snapshot -i
+  agent-browser snapshot -i --urls
   agent-browser snapshot --compact --depth 5
   agent-browser snapshot -s "#main-content"
 "##
@@ -1560,11 +1597,14 @@ Examples:
             r##"
 agent-browser close - Close the browser
 
-Usage: agent-browser close
+Usage: agent-browser close [options]
 
 Closes the browser instance for the current session.
 
 Aliases: quit, exit
+
+Options:
+  --all                Close all active sessions
 
 Global Options:
   --json               Output as JSON
@@ -1573,6 +1613,7 @@ Global Options:
 Examples:
   agent-browser close
   agent-browser close --session mysession
+  agent-browser close --all
 "##
         }
 
@@ -2352,6 +2393,39 @@ Examples:
 "##
         }
 
+        // === Dashboard ===
+        "dashboard" => {
+            r##"
+agent-browser dashboard - Observability dashboard
+
+Usage: agent-browser dashboard [start|stop] [options]
+
+Manage the observability dashboard, a local web UI that shows live
+browser viewports and command activity feeds for all sessions.
+The dashboard is bundled into the binary and requires no separate install.
+
+Subcommands:
+  start [--port <n>]   Start the dashboard server (default port: 4848)
+  stop                 Stop the dashboard server
+
+Running 'agent-browser dashboard' with no subcommand is equivalent to 'dashboard start'.
+
+The dashboard runs as a standalone background process, independent of
+browser sessions. All sessions automatically stream to the dashboard.
+
+Options:
+  --port <n>           Port for the dashboard server (default: 4848)
+
+Global Options:
+  --json               Output as JSON
+
+Examples:
+  agent-browser dashboard start
+  agent-browser dashboard start --port 8080
+  agent-browser dashboard stop
+"##
+        }
+
         // === Connect ===
         "connect" => {
             r##"
@@ -2389,6 +2463,39 @@ Examples:
   # After connecting, run commands normally
   agent-browser snapshot
   agent-browser click @e1
+"##
+        }
+
+        // === Runtime streaming ===
+        "stream" => {
+            r##"
+agent-browser stream - Manage live WebSocket browser streaming
+
+Usage:
+  agent-browser stream enable [--port <port>]
+  agent-browser stream disable
+  agent-browser stream status
+
+Enables or disables the session-scoped WebSocket stream server without restarting
+an already-running daemon. If --port is omitted, agent-browser binds an
+available localhost port automatically and reports it back.
+
+Notes:
+  - 'stream enable' creates the WebSocket server.
+  - WebSocket clients trigger frame streaming automatically.
+  - 'screencast_start' and 'screencast_stop' still control explicit CDP screencasts.
+  - Streaming is always enabled. Set AGENT_BROWSER_STREAM_PORT to bind to a
+    specific port instead of the default OS-assigned port.
+
+Global Options:
+  --json               Output as JSON
+  --session <name>     Use specific session
+
+Examples:
+  agent-browser stream status
+  agent-browser stream enable
+  agent-browser stream enable --port 9223
+  agent-browser stream disable
 "##
         }
 
@@ -2515,20 +2622,24 @@ Examples:
 
         "batch" => {
             r##"
-agent-browser batch - Execute multiple commands from stdin
+agent-browser batch - Execute multiple commands sequentially
 
-Usage: echo '<json>' | agent-browser batch [options]
+Usage: agent-browser batch [options] "<cmd1>" "<cmd2>" ...
+       echo '<json>' | agent-browser batch [options]
 
-Reads a JSON array of commands from stdin and executes them sequentially.
-Each command is an array of strings matching normal CLI arguments.
-Results are printed in order, separated by blank lines (or as a JSON array
-with --json).
+Runs multiple commands in sequence. Commands can be passed as quoted
+arguments or piped as JSON via stdin. Results are printed in order,
+separated by blank lines (or as a JSON array with --json).
 
 Options:
   --bail               Stop on first error (default: continue all commands)
   --json               Output results as a JSON array
 
-Input Format:
+Argument Mode:
+  Each quoted argument is a full command string:
+  agent-browser batch "open https://example.com" "snapshot -i" "screenshot"
+
+Stdin Mode (JSON):
   A JSON array of string arrays. Each inner array is one command:
   [
     ["open", "https://example.com"],
@@ -2539,9 +2650,64 @@ Input Format:
   ]
 
 Examples:
+  agent-browser batch "open https://example.com" "screenshot"
+  agent-browser batch --bail "open https://example.com" "click @e1" "screenshot"
   echo '[["open", "https://example.com"], ["snapshot"]]' | agent-browser batch
-  echo '[["open", "https://example.com"], ["get", "title"]]' | agent-browser batch --json
   agent-browser batch --bail < commands.json
+"##
+        }
+
+        "profiles" => {
+            r##"
+agent-browser profiles - List available Chrome profiles
+
+Usage: agent-browser profiles
+
+Lists all Chrome profiles found in your Chrome user data directory, showing
+the directory name and display name for each profile. Use the directory name
+with --profile to launch Chrome with that profile's login state.
+
+Global Options:
+  --json               Output as JSON
+
+Examples:
+  agent-browser profiles
+  agent-browser profiles --json
+  agent-browser --profile Default open https://gmail.com
+"##
+        }
+
+        "chat" => {
+            r##"
+agent-browser chat - Natural language browser control via AI
+
+Usage:
+  agent-browser chat <message>         Single-shot: execute instruction and exit
+  agent-browser chat                   Interactive REPL (when stdin is a TTY)
+  echo "instruction" | agent-browser chat   Piped input
+
+Sends natural language instructions to an AI model that translates them
+into agent-browser commands and executes them against the active session.
+Requires AI_GATEWAY_API_KEY to be set.
+
+In interactive mode, type "quit", "exit", or "q" to leave the REPL.
+
+Chat Options:
+  --model <name>         AI model (or AI_GATEWAY_MODEL env, default: anthropic/claude-sonnet-4.6)
+  -v, --verbose          Show tool commands and their raw output
+  -q, --quiet            Show only the AI text response (hide tool calls)
+
+Global Options:
+  --json                 Structured JSON output per turn
+  --session <name>       Target session for commands
+
+Examples:
+  agent-browser chat "open google.com and search for cats"
+  agent-browser chat "take a screenshot of the current page"
+  agent-browser -q chat "summarize this page"
+  agent-browser -v chat "fill in the login form with test@example.com"
+  agent-browser --model openai/gpt-4o chat "navigate to hacker news"
+  agent-browser chat
 "##
         }
 
@@ -2583,7 +2749,7 @@ Core Commands:
   snapshot                   Accessibility tree with refs (for AI)
   eval <js>                  Run JavaScript
   connect <port|url>         Connect to browser via CDP
-  close                      Close browser
+  close [--all]              Close browser (--all closes every session)
 
 Navigation:
   back                       Go back
@@ -2636,9 +2802,14 @@ Debug:
   inspect                    Open Chrome DevTools for the active page
   clipboard <op> [text]      Read/write clipboard (read, write, copy, paste)
 
+Streaming:
+  stream enable [--port <n>] Start runtime WebSocket streaming for this session
+  stream disable             Stop runtime WebSocket streaming
+  stream status              Show streaming status and active port
+
 Batch:
-  batch [--bail]             Execute commands from stdin (JSON array of string arrays)
-                             --bail stops on first error (default: continue all)
+  batch [--bail] ["cmd" ...]  Execute multiple commands sequentially (args or stdin)
+                              --bail stops on first error (default: continue all)
 
 Auth Vault:
   auth save <name> [opts]    Save auth profile (--url, --username, --password/--password-stdin)
@@ -2655,10 +2826,22 @@ Sessions:
   session                    Show current session name
   session list               List active sessions
 
+Chat (AI):
+  chat <message>             Send a natural language instruction (single-shot)
+  chat                       Start interactive chat (REPL mode when stdin is a TTY)
+  Options: --model <name>, -v/--verbose, -q/--quiet
+
+Dashboard:
+  dashboard [start]          Start the dashboard server (default port: 4848)
+  dashboard start --port <n> Start on a specific port
+  dashboard stop             Stop the dashboard server
+
 Setup:
   install                    Install browser binaries
   install --with-deps        Also install system dependencies (Linux)
   upgrade                    Upgrade to the latest version
+  dashboard start            Start the observability dashboard
+  profiles                   List available Chrome profiles
 
 Snapshot Options:
   -i, --interactive          Only interactive elements
@@ -2667,7 +2850,8 @@ Snapshot Options:
   -s, --selector <sel>       Scope to CSS selector
 
 Authentication:
-  --profile <path>           Persist login sessions across restarts (cookies, IndexedDB, cache)
+  --profile <name|path>      Chrome profile name (e.g., Default) to reuse login state,
+                             or a directory path for a persistent custom profile
                              (or AGENT_BROWSER_PROFILE env)
   --session-name <name>      Auto-save/restore cookies and localStorage by name
                              (or AGENT_BROWSER_SESSION_NAME env)
@@ -2692,7 +2876,7 @@ Options:
   --ca-cert <path>           Trust a specific CA certificate for HTTPS interception proxies
                              (or AGENT_BROWSER_CA_CERT). Computes SPKI hash for Chromium.
   --allow-file-access        Allow file:// URLs to access local files (Chromium only)
-  -p, --provider <name>      Browser provider: ios, browserbase, kernel, browseruse, browserless
+  -p, --provider <name>      Browser provider: ios, browserbase, kernel, browseruse, browserless, agentcore
   --device <name>            iOS device name (e.g., "iPhone 15 Pro")
   --json                     JSON output
   --annotate                 Annotated screenshot with numbered labels and legend
@@ -2710,6 +2894,10 @@ Options:
   --confirm-actions <list>   Categories requiring confirmation (or AGENT_BROWSER_CONFIRM_ACTIONS)
   --confirm-interactive      Interactive confirmation prompts; auto-denies if stdin is not a TTY (or AGENT_BROWSER_CONFIRM_INTERACTIVE)
   --engine <name>            Browser engine: chrome (default), lightpanda (or AGENT_BROWSER_ENGINE)
+  --no-auto-dialog           Disable automatic dismissal of alert/beforeunload dialogs (or AGENT_BROWSER_NO_AUTO_DIALOG)
+  --model <name>             AI model for chat (or AI_GATEWAY_MODEL env)
+  -v, --verbose              Show tool commands and their raw output
+  -q, --quiet                Show only AI text responses (hide tool calls)
   --config <path>            Use a custom config file (or AGENT_BROWSER_CONFIG env)
   --debug                    Debug output
   --version, -V              Show version
@@ -2747,7 +2935,7 @@ Environment:
   AGENT_BROWSER_DEBUG            Debug output
   AGENT_BROWSER_IGNORE_HTTPS_ERRORS Ignore HTTPS certificate errors
   AGENT_BROWSER_CA_CERT          Path to CA certificate to trust (HTTPS interception proxies)
-  AGENT_BROWSER_PROVIDER         Browser provider (ios, browserbase, kernel, browseruse, browserless)
+  AGENT_BROWSER_PROVIDER         Browser provider (ios, browserbase, kernel, browseruse, browserless, agentcore)
   AGENT_BROWSER_AUTO_CONNECT     Auto-discover and connect to running Chrome
   AGENT_BROWSER_ALLOW_FILE_ACCESS Allow file:// URLs to access local files
   AGENT_BROWSER_COLOR_SCHEME     Color scheme preference (dark, light, no-preference)
@@ -2756,7 +2944,7 @@ Environment:
   AGENT_BROWSER_SESSION_NAME     Auto-save/load state persistence name
   AGENT_BROWSER_STATE_EXPIRE_DAYS Auto-delete saved states older than N days (default: 30)
   AGENT_BROWSER_ENCRYPTION_KEY   64-char hex key for AES-256-GCM session encryption
-  AGENT_BROWSER_STREAM_PORT      Enable WebSocket streaming on port (e.g., 9223)
+  AGENT_BROWSER_STREAM_PORT      Override WebSocket streaming port (default: OS-assigned)
   AGENT_BROWSER_IDLE_TIMEOUT_MS  Auto-shutdown daemon after N ms of inactivity (disabled by default)
   AGENT_BROWSER_IOS_DEVICE       Default iOS device name
   AGENT_BROWSER_IOS_UDID         Default iOS device UDID
@@ -2766,6 +2954,7 @@ Environment:
   AGENT_BROWSER_ACTION_POLICY    Path to action policy JSON file
   AGENT_BROWSER_CONFIRM_ACTIONS  Action categories requiring confirmation
   AGENT_BROWSER_CONFIRM_INTERACTIVE Enable interactive confirmation prompts
+  AGENT_BROWSER_NO_AUTO_DIALOG   Disable automatic dismissal of alert/beforeunload dialogs
   AGENT_BROWSER_ENGINE           Browser engine: chrome (default), lightpanda
   HTTP_PROXY / HTTPS_PROXY       Standard proxy env vars (fallback if AGENT_BROWSER_PROXY not set)
   ALL_PROXY                      SOCKS proxy (fallback for proxy)
@@ -2773,6 +2962,9 @@ Environment:
   AGENT_BROWSER_SCREENSHOT_DIR   Default screenshot output directory
   AGENT_BROWSER_SCREENSHOT_QUALITY JPEG quality 0-100
   AGENT_BROWSER_SCREENSHOT_FORMAT Screenshot format: png, jpeg
+  AI_GATEWAY_URL                 Vercel AI Gateway base URL (default: https://ai-gateway.vercel.sh)
+  AI_GATEWAY_API_KEY             API key for the AI Gateway (enables chat command and dashboard AI chat)
+  AI_GATEWAY_MODEL               Default AI model (default: anthropic/claude-sonnet-4.6, or --model flag)
 
 Install:
   npm install -g agent-browser           # npm
@@ -2789,19 +2981,26 @@ Examples:
   agent-browser get text @e1
   agent-browser screenshot --full
   agent-browser screenshot --annotate    # Labeled screenshot for vision models
-  agent-browser wait --load networkidle  # Wait for slow pages to load
+  agent-browser wait 2000               # Wait for slow pages to settle
   agent-browser --cdp 9222 snapshot      # Connect via CDP port
   agent-browser --auto-connect snapshot  # Auto-discover running Chrome
+  agent-browser stream enable            # Start runtime streaming on an auto-selected port
+  agent-browser stream status            # Inspect runtime streaming state
   agent-browser --color-scheme dark open example.com  # Dark mode
-  agent-browser --profile ~/.myapp open example.com    # Persistent profile
+  agent-browser --profile Default open gmail.com        # Reuse Chrome login state
+  agent-browser --profile ~/.myapp open example.com    # Persistent custom profile
+  agent-browser profiles                               # List available Chrome profiles
   agent-browser --session-name myapp open example.com  # Auto-save/restore state
+  agent-browser chat "open google.com and search for cats"  # AI chat (single-shot)
+  agent-browser chat                                        # AI chat (interactive REPL)
+  agent-browser -q chat "summarize this page"               # Quiet mode (text only)
 
 Command Chaining:
   Chain commands with && in a single shell call (browser persists via daemon):
 
-  agent-browser open example.com && agent-browser wait --load networkidle && agent-browser snapshot -i
+  agent-browser open example.com && agent-browser snapshot -i
   agent-browser fill @e1 "user@example.com" && agent-browser fill @e2 "pass" && agent-browser click @e3
-  agent-browser open example.com && agent-browser wait --load networkidle && agent-browser screenshot page.png
+  agent-browser open example.com && agent-browser screenshot
 
 iOS Simulator (requires Xcode and Appium):
   agent-browser -p ios open example.com                    # Use default iPhone
@@ -2897,6 +3096,33 @@ pub fn print_version() {
 mod tests {
     use super::format_storage_text;
     use serde_json::json;
+
+    #[test]
+    fn test_format_stream_status_text_for_enabled_stream() {
+        let data = json!({
+            "enabled": true,
+            "port": 9223,
+            "connected": true,
+            "screencasting": false
+        });
+
+        let rendered = super::format_stream_status_text(Some("stream_status"), &data).unwrap();
+
+        assert_eq!(
+            rendered,
+            "Streaming enabled on ws://127.0.0.1:9223\nConnected: true\nScreencasting: false"
+        );
+    }
+
+    #[test]
+    fn test_format_stream_status_text_for_disabled_stream() {
+        let data =
+            json!({ "enabled": false, "port": null, "connected": false, "screencasting": false });
+
+        let rendered = super::format_stream_status_text(Some("stream_status"), &data).unwrap();
+
+        assert_eq!(rendered, "Streaming disabled");
+    }
 
     #[test]
     fn test_format_storage_text_for_all_entries() {

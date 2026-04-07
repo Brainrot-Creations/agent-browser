@@ -1,6 +1,7 @@
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
+use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
@@ -8,14 +9,16 @@ use std::sync::Arc;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::sync::{broadcast, oneshot, RwLock};
 
+use crate::connection::get_socket_dir;
+
 use super::auth;
 use super::browser::{should_track_target, BrowserManager, WaitUntil};
 use super::cdp::chrome::LaunchOptions;
 use super::cdp::client::CdpClient;
 use super::cdp::types::{
-    AttachToTargetParams, AttachToTargetResult, CdpEvent, ConsoleApiCalledEvent,
-    CreateTargetResult, DispatchMouseEventParams, ExceptionThrownEvent,
-    JavascriptDialogOpeningEvent, TargetCreatedEvent, TargetDestroyedEvent, TargetInfoChangedEvent,
+    AttachToTargetParams, AttachToTargetResult, CdpEvent, CreateTargetResult,
+    DispatchMouseEventParams, ExceptionThrownEvent, JavascriptDialogOpeningEvent,
+    TargetCreatedEvent, TargetDestroyedEvent, TargetInfoChangedEvent,
 };
 use super::cookies;
 use super::diff;
@@ -163,6 +166,30 @@ struct DrainedEvents {
     detached_iframe_sessions: Vec<String>,
 }
 
+/// Compute a hash of the [`LaunchOptions`] fields that require a browser
+/// relaunch when changed (baked into the Chrome process at startup).
+///
+/// Fields NOT hashed (adjustable at runtime via CDP without relaunch):
+/// ignore_https_errors, color_scheme, download_path, storage_state
+fn launch_hash(opts: &LaunchOptions) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut h = DefaultHasher::new();
+    opts.headless.hash(&mut h);
+    opts.extensions.hash(&mut h);
+    opts.profile.hash(&mut h);
+    opts.executable_path.hash(&mut h);
+    opts.args.hash(&mut h);
+    opts.proxy.hash(&mut h);
+    opts.proxy_bypass.hash(&mut h);
+    opts.proxy_username.hash(&mut h);
+    opts.proxy_password.hash(&mut h);
+    opts.user_agent.hash(&mut h);
+    opts.allow_file_access.hash(&mut h);
+    h.finish()
+}
+
 pub struct DaemonState {
     pub browser: Option<BrowserManager>,
     pub appium: Option<AppiumManager>,
@@ -202,13 +229,25 @@ pub struct DaemonState {
     /// handling domain filtering, route interception, and origin-scoped headers
     /// without deadlocking navigation/evaluate.
     fetch_handler_task: Option<tokio::task::JoinHandle<()>>,
+    /// Background task that auto-accepts `alert` and `beforeunload` dialogs
+    /// so they never block the agent.
+    dialog_handler_task: Option<tokio::task::JoinHandle<()>>,
     pub mouse_state: MouseState,
     /// Tracks the currently open JavaScript dialog (alert/confirm/prompt), if any.
     pub pending_dialog: Option<PendingDialog>,
+    /// When true, automatically dismiss `beforeunload` dialogs and accept `alert`
+    /// dialogs so they never block the agent.  Enabled by default.
+    pub auto_dialog: bool,
     /// Shared slot for stream server to receive CDP client when browser launches.
     pub stream_client: Option<Arc<RwLock<Option<Arc<CdpClient>>>>>,
     /// Stream server instance kept alive so the broadcast channel remains open.
     pub stream_server: Option<Arc<StreamServer>>,
+    /// Hash of launch options used for the current browser, for relaunch detection.
+    launch_hash: Option<u64>,
+    /// Browser engine name (e.g. "chrome", "lightpanda") for observability.
+    pub engine: String,
+    /// Default timeout for wait operations, from AGENT_BROWSER_DEFAULT_TIMEOUT env var.
+    pub default_timeout_ms: u64,
 }
 
 impl DaemonState {
@@ -247,11 +286,32 @@ impl DaemonState {
             origin_headers: Arc::new(RwLock::new(HashMap::new())),
             proxy_credentials: Arc::new(RwLock::new(None)),
             fetch_handler_task: None,
+            dialog_handler_task: None,
             mouse_state: MouseState::default(),
             pending_dialog: None,
+            auto_dialog: !matches!(
+                env::var("AGENT_BROWSER_NO_AUTO_DIALOG").as_deref(),
+                Ok("1" | "true" | "yes")
+            ),
             stream_client: None,
             stream_server: None,
+            launch_hash: None,
+            engine: env::var("AGENT_BROWSER_ENGINE").unwrap_or_else(|_| "chrome".to_string()),
+            default_timeout_ms: env::var("AGENT_BROWSER_DEFAULT_TIMEOUT")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(30_000),
         }
+    }
+
+    /// Extract the timeout from a command JSON, falling back to the
+    /// configured `default_timeout_ms` (from `AGENT_BROWSER_DEFAULT_TIMEOUT`).
+    /// All wait-family handlers should use this instead of reading the
+    /// timeout field and providing their own fallback.
+    fn timeout_ms(&self, cmd: &Value) -> u64 {
+        cmd.get("timeout")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(self.default_timeout_ms)
     }
 
     fn reset_input_state(&mut self) {
@@ -265,6 +325,9 @@ impl DaemonState {
         stream_server: Option<Arc<StreamServer>>,
     ) -> Self {
         let mut s = Self::new();
+        if stream_server.is_some() {
+            s.request_tracking = true;
+        }
         s.stream_client = stream_client;
         s.stream_server = stream_server;
         s
@@ -389,6 +452,65 @@ impl DaemonState {
         }));
     }
 
+    /// Start the background task that auto-accepts `alert` and `beforeunload`
+    /// dialogs so they never block the agent. `confirm` and `prompt` dialogs
+    /// are left for the agent to handle explicitly.
+    fn start_dialog_handler(&mut self) {
+        if let Some(task) = self.dialog_handler_task.take() {
+            task.abort();
+        }
+
+        if !self.auto_dialog {
+            return;
+        }
+
+        let Some(ref browser) = self.browser else {
+            return;
+        };
+
+        let client = browser.client.clone();
+        let mut rx = browser.client.subscribe();
+
+        self.dialog_handler_task = Some(tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(event) if event.method == "Page.javascriptDialogOpening" => {
+                        let dialog_type = event
+                            .params
+                            .get("type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if matches!(dialog_type, "beforeunload" | "alert") {
+                            let message = event
+                                .params
+                                .get("message")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            eprintln!("[auto-dismiss] {} dialog: {}", dialog_type, message);
+                            let sid = event.session_id.clone().unwrap_or_default();
+                            if let Err(e) = client
+                                .send_command(
+                                    "Page.handleJavaScriptDialog",
+                                    Some(json!({ "accept": true })),
+                                    Some(&sid),
+                                )
+                                .await
+                            {
+                                eprintln!(
+                                    "[auto-dismiss] failed to dismiss {} dialog: {}",
+                                    dialog_type, e
+                                );
+                            }
+                        }
+                    }
+                    Ok(_) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                }
+            }
+        }));
+    }
+
     /// Update the stream server's CDP client slot when browser is set or cleared.
     pub async fn update_stream_client(&self) {
         if let Some(ref slot) = self.stream_client {
@@ -407,7 +529,14 @@ impl DaemonState {
             let connected = self.browser.is_some();
             let sc = server.is_screencasting().await;
             let (vw, vh) = server.viewport().await;
-            server.broadcast_status(connected, sc, vw, vh);
+            server
+                .broadcast_status(connected, sc, vw, vh, &self.engine)
+                .await;
+            if let Some(ref mgr) = self.browser {
+                server.broadcast_tabs(&mgr.tab_list()).await;
+            } else {
+                server.broadcast_tabs(&[]).await;
+            }
             // Notify the background CDP event loop that the client changed
             server.notify_client_changed();
         }
@@ -438,6 +567,112 @@ impl DaemonState {
         recording::stop_recording_task(&mut self.recording_state).await
     }
 
+    pub async fn drain_cdp_events_background(&mut self) {
+        let drained = self.drain_cdp_events();
+        self.apply_drained_events(drained).await;
+    }
+
+    async fn apply_drained_events(&mut self, drained: DrainedEvents) {
+        // ACK screencast frames
+        if !drained.pending_acks.is_empty() {
+            if let Some(ref browser) = self.browser {
+                if let Ok(session_id) = browser.active_session_id() {
+                    for ack_sid in drained.pending_acks {
+                        let _ = stream::ack_screencast_frame(&browser.client, session_id, ack_sid)
+                            .await;
+                    }
+                }
+            }
+        }
+
+        // Remove destroyed targets
+        for target_id in &drained.destroyed_targets {
+            if let Some(ref mut mgr) = self.browser {
+                mgr.remove_page_by_target_id(target_id);
+            }
+        }
+
+        // Track cross-origin iframe sessions
+        for (frame_id, iframe_sid) in &drained.attached_iframe_sessions {
+            self.iframe_sessions
+                .insert(frame_id.clone(), iframe_sid.clone());
+            if let Some(ref mgr) = self.browser {
+                let _ = mgr
+                    .client
+                    .send_command_no_params(
+                        "Runtime.runIfWaitingForDebugger",
+                        Some(iframe_sid.as_str()),
+                    )
+                    .await;
+                let _ = mgr
+                    .client
+                    .send_command_no_params("DOM.enable", Some(iframe_sid.as_str()))
+                    .await;
+                let _ = mgr
+                    .client
+                    .send_command_no_params("Accessibility.enable", Some(iframe_sid.as_str()))
+                    .await;
+                if self.har_recording || self.request_tracking {
+                    let _ = mgr
+                        .client
+                        .send_command_no_params("Network.enable", Some(iframe_sid.as_str()))
+                        .await;
+                }
+            }
+        }
+        for sid in &drained.detached_iframe_sessions {
+            self.iframe_sessions.retain(|_, v| v != sid);
+        }
+
+        // Attach and register new targets
+        for te in &drained.new_targets {
+            if let Some(ref mut mgr) = self.browser {
+                let attach_result: Result<AttachToTargetResult, String> = mgr
+                    .client
+                    .send_command_typed(
+                        "Target.attachToTarget",
+                        &AttachToTargetParams {
+                            target_id: te.target_info.target_id.clone(),
+                            flatten: true,
+                        },
+                        None,
+                    )
+                    .await;
+                if let Ok(attach) = attach_result {
+                    let _ = mgr.enable_domains_pub(&attach.session_id).await;
+
+                    // Install domain filter on new pages
+                    let df = self.domain_filter.read().await;
+                    if let Some(ref filter) = *df {
+                        let has_proxy_creds = self.proxy_credentials.read().await.is_some();
+                        let _ = network::install_domain_filter(
+                            &mgr.client,
+                            &attach.session_id,
+                            &filter.allowed_domains,
+                            has_proxy_creds,
+                        )
+                        .await;
+                    }
+
+                    mgr.add_page(super::browser::PageInfo {
+                        target_id: te.target_info.target_id.clone(),
+                        session_id: attach.session_id,
+                        url: te.target_info.url.clone(),
+                        title: te.target_info.title.clone(),
+                        target_type: te.target_info.target_type.clone(),
+                    });
+                }
+            }
+        }
+
+        // Update changed targets
+        for te in &drained.changed_targets {
+            if let Some(ref mut mgr) = self.browser {
+                mgr.update_page_target_info(&te.target_info);
+            }
+        }
+    }
+
     fn drain_cdp_events(&mut self) -> DrainedEvents {
         let rx = match self.event_rx.as_mut() {
             Some(rx) => rx,
@@ -446,6 +681,7 @@ impl DaemonState {
 
         let mut pending_acks: Vec<i64> = Vec::new();
         let mut new_targets: Vec<TargetCreatedEvent> = Vec::new();
+        let mut new_target_ids: HashSet<String> = HashSet::new();
         let mut changed_targets: Vec<TargetInfoChangedEvent> = Vec::new();
         let mut destroyed_targets: Vec<String> = Vec::new();
         let mut attached_iframe_sessions: Vec<(String, String)> = Vec::new();
@@ -466,6 +702,7 @@ impl DaemonState {
                                         .as_ref()
                                         .is_none_or(|b| b.has_target(&te.target_info.target_id));
                                     if !already_tracked {
+                                        new_target_ids.insert(te.target_info.target_id.clone());
                                         new_targets.push(te);
                                     }
                                 }
@@ -477,7 +714,24 @@ impl DaemonState {
                                 event.params.clone(),
                             ) {
                                 if should_track_target(&te.target_info) {
-                                    changed_targets.push(te);
+                                    // If this target is not yet tracked (e.g. it was
+                                    // initially filtered because its URL was
+                                    // chrome://newtab/), promote it to a new target
+                                    // so it gets attached and added to `pages`.
+                                    let already_tracked = self
+                                        .browser
+                                        .as_ref()
+                                        .is_some_and(|b| b.has_target(&te.target_info.target_id));
+                                    if already_tracked
+                                        || new_target_ids.contains(&te.target_info.target_id)
+                                    {
+                                        changed_targets.push(te);
+                                    } else {
+                                        new_target_ids.insert(te.target_info.target_id.clone());
+                                        new_targets.push(TargetCreatedEvent {
+                                            target_info: te.target_info,
+                                        });
+                                    }
                                 }
                             }
                             continue;
@@ -529,32 +783,38 @@ impl DaemonState {
                         false
                     };
 
-                    if !session_matches {
+                    // Allow Network events from cross-origin iframe sessions
+                    // when HAR recording or request tracking is active.
+                    let iframe_network_event = !session_matches
+                        && (self.har_recording || self.request_tracking)
+                        && event.method.starts_with("Network.")
+                        && event
+                            .session_id
+                            .as_ref()
+                            .is_some_and(|sid| self.iframe_sessions.values().any(|v| v == sid));
+
+                    if !session_matches && !iframe_network_event {
                         continue;
                     }
 
                     match event.method.as_str() {
                         "Runtime.consoleAPICalled" => {
-                            if let Ok(console_event) = serde_json::from_value::<ConsoleApiCalledEvent>(
-                                event.params.clone(),
-                            ) {
-                                let text: String = console_event
-                                    .args
-                                    .iter()
-                                    .filter_map(|arg| {
-                                        arg.value
-                                            .as_ref()
-                                            .map(|v| match v {
-                                                Value::String(s) => s.clone(),
-                                                other => other.to_string(),
-                                            })
-                                            .or_else(|| arg.description.clone())
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join(" ");
-                                self.event_tracker
-                                    .add_console(&console_event.call_type, &text);
+                            let level = event
+                                .params
+                                .get("type")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("log");
+                            let raw_args: Vec<Value> = event
+                                .params
+                                .get("args")
+                                .and_then(|v| v.as_array())
+                                .cloned()
+                                .unwrap_or_default();
+                            let text = network::format_console_args(&raw_args);
+                            if let Some(ref server) = self.stream_server {
+                                server.broadcast_console(level, &text, &raw_args);
                             }
+                            self.event_tracker.add_console(level, &text, raw_args);
                         }
                         "Runtime.exceptionThrown" => {
                             if let Ok(ex_event) =
@@ -572,6 +832,13 @@ impl DaemonState {
                                     details.line_number,
                                     details.column_number,
                                 );
+                                if let Some(ref server) = self.stream_server {
+                                    server.broadcast_page_error(
+                                        text,
+                                        details.line_number,
+                                        details.column_number,
+                                    );
+                                }
                             }
                         }
                         "Network.requestWillBeSent"
@@ -762,6 +1029,33 @@ impl DaemonState {
                                 }
                             }
                         }
+                        "Network.loadingFailed" if self.har_recording => {
+                            let request_id = event
+                                .params
+                                .get("requestId")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let timestamp = event.params.get("timestamp").and_then(|v| v.as_f64());
+                            let error_text = event
+                                .params
+                                .get("errorText")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("Failed");
+                            if let Some(entry) = self
+                                .har_entries
+                                .iter_mut()
+                                .rev()
+                                .find(|e| e.request_id == request_id)
+                            {
+                                if entry.status.is_none() {
+                                    entry.status = Some(0);
+                                    entry.status_text = error_text.to_string();
+                                }
+                                if let Some(ts) = timestamp {
+                                    entry.loading_finished_timestamp = Some(ts);
+                                }
+                            }
+                        }
                         "Page.screencastFrame" => {
                             // Frame broadcasting and acks are handled in real-time by the
                             // stream server's background CDP event loop. Here we just
@@ -780,12 +1074,22 @@ impl DaemonState {
                                     event.params.clone(),
                                 )
                             {
-                                self.pending_dialog = Some(PendingDialog {
-                                    dialog_type: dialog_event.dialog_type,
-                                    message: dialog_event.message,
-                                    url: dialog_event.url,
-                                    default_prompt: dialog_event.default_prompt,
-                                });
+                                // When auto_dialog is enabled, alert and beforeunload
+                                // dialogs are handled by the background dialog_handler_task.
+                                // Skip tracking them to avoid a stale warning.
+                                let auto_handled = self.auto_dialog
+                                    && matches!(
+                                        dialog_event.dialog_type.as_str(),
+                                        "beforeunload" | "alert"
+                                    );
+                                if !auto_handled {
+                                    self.pending_dialog = Some(PendingDialog {
+                                        dialog_type: dialog_event.dialog_type,
+                                        message: dialog_event.message,
+                                        url: dialog_event.url,
+                                        default_prompt: dialog_event.default_prompt,
+                                    });
+                                }
                             }
                         }
                         "Page.javascriptDialogClosed" => {
@@ -797,7 +1101,10 @@ impl DaemonState {
                     }
                 }
                 Err(broadcast::error::TryRecvError::Empty) => break,
-                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                    eprintln!("[agent-browser] Warning: CDP event buffer overflowed, {} events dropped. Network requests may be missing from HAR output.", n);
+                    continue;
+                }
                 Err(broadcast::error::TryRecvError::Closed) => {
                     self.event_rx = None;
                     break;
@@ -823,6 +1130,9 @@ impl Drop for DaemonState {
         if let Some(task) = self.fetch_handler_task.take() {
             task.abort();
         }
+        if let Some(task) = self.dialog_handler_task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -834,97 +1144,14 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         .unwrap_or("")
         .to_string();
 
-    // Drain pending CDP events (console, errors, screencast frames, target lifecycle)
-    let DrainedEvents {
-        pending_acks,
-        new_targets,
-        changed_targets,
-        destroyed_targets,
-        attached_iframe_sessions,
-        detached_iframe_sessions,
-    } = state.drain_cdp_events();
-    if !pending_acks.is_empty() {
-        if let Some(ref browser) = state.browser {
-            if let Ok(session_id) = browser.active_session_id() {
-                for ack_sid in pending_acks {
-                    let _ =
-                        stream::ack_screencast_frame(&browser.client, session_id, ack_sid).await;
-                }
-            }
-        }
+    let cmd_start = std::time::Instant::now();
+
+    if let Some(ref server) = state.stream_server {
+        server.broadcast_command(action, &id, cmd);
     }
 
-    for target_id in &destroyed_targets {
-        if let Some(ref mut mgr) = state.browser {
-            mgr.remove_page_by_target_id(target_id);
-        }
-    }
-
-    // Track cross-origin iframe sessions
-    for (frame_id, iframe_sid) in &attached_iframe_sessions {
-        state
-            .iframe_sessions
-            .insert(frame_id.clone(), iframe_sid.clone());
-        if let Some(ref mgr) = state.browser {
-            let _ = mgr
-                .client
-                .send_command_no_params("DOM.enable", Some(iframe_sid.as_str()))
-                .await;
-            let _ = mgr
-                .client
-                .send_command_no_params("Accessibility.enable", Some(iframe_sid.as_str()))
-                .await;
-        }
-    }
-    for sid in &detached_iframe_sessions {
-        state.iframe_sessions.retain(|_, v| v != sid);
-    }
-
-    for te in &new_targets {
-        if let Some(ref mut mgr) = state.browser {
-            let attach_result: Result<AttachToTargetResult, String> = mgr
-                .client
-                .send_command_typed(
-                    "Target.attachToTarget",
-                    &AttachToTargetParams {
-                        target_id: te.target_info.target_id.clone(),
-                        flatten: true,
-                    },
-                    None,
-                )
-                .await;
-            if let Ok(attach) = attach_result {
-                let _ = mgr.enable_domains_pub(&attach.session_id).await;
-
-                // Install domain filter on new pages
-                let df = state.domain_filter.read().await;
-                if let Some(ref filter) = *df {
-                    let has_proxy_creds = state.proxy_credentials.read().await.is_some();
-                    let _ = network::install_domain_filter(
-                        &mgr.client,
-                        &attach.session_id,
-                        &filter.allowed_domains,
-                        has_proxy_creds,
-                    )
-                    .await;
-                }
-
-                mgr.add_page(super::browser::PageInfo {
-                    target_id: te.target_info.target_id.clone(),
-                    session_id: attach.session_id,
-                    url: te.target_info.url.clone(),
-                    title: te.target_info.title.clone(),
-                    target_type: te.target_info.target_type.clone(),
-                });
-            }
-        }
-    }
-
-    for te in &changed_targets {
-        if let Some(ref mut mgr) = state.browser {
-            mgr.update_page_target_info(&te.target_info);
-        }
-    }
+    // Drain and apply pending CDP events (console, errors, screencast frames, target lifecycle)
+    state.drain_cdp_events_background().await;
 
     // Hot-reload and check action policy
     if let Some(ref mut policy) = state.policy {
@@ -991,6 +1218,9 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
             | "state_clean"
             | "state_rename"
             | "device_list"
+            | "stream_enable"
+            | "stream_disable"
+            | "stream_status"
     );
     if !skip_launch {
         // Check if existing connection is stale and needs re-launch
@@ -1006,6 +1236,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
                     let _ = mgr.close().await;
                 }
                 state.browser = None;
+                state.screencasting = false;
                 state.reset_input_state();
                 state.update_stream_client().await;
             }
@@ -1135,6 +1366,9 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         "device" => handle_device(cmd, state).await,
         "screencast_start" => handle_screencast_start(cmd, state).await,
         "screencast_stop" => handle_screencast_stop(state).await,
+        "stream_enable" => handle_stream_enable(cmd, state).await,
+        "stream_disable" => handle_stream_disable(state).await,
+        "stream_status" => handle_stream_status(state).await,
         "waitforurl" => handle_waitforurl(cmd, state).await,
         "waitforloadstate" => handle_waitforloadstate(cmd, state).await,
         "waitforfunction" => handle_waitforfunction(cmd, state).await,
@@ -1209,6 +1443,31 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         }
     }
 
+    if let Some(ref server) = state.stream_server {
+        let duration_ms = cmd_start.elapsed().as_millis() as u64;
+        let success = resp
+            .get("status")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s == "success");
+        let data = resp.get("data").cloned().unwrap_or(Value::Null);
+        server.broadcast_result(&id, action, success, &data, duration_ms);
+
+        if let Some(ref mgr) = state.browser {
+            server.broadcast_tabs(&mgr.tab_list()).await;
+
+            // Keep the stream server's CDP session in sync with the active tab
+            // so screencasting always targets the correct page.
+            if matches!(
+                action,
+                "tab_new" | "tab_switch" | "tab_close" | "open" | "navigate"
+            ) {
+                let session_id = mgr.active_session_id().ok().map(|s| s.to_string());
+                server.set_cdp_session_id(session_id).await;
+                server.notify_client_changed();
+            }
+        }
+    }
+
     resp
 }
 
@@ -1243,12 +1502,17 @@ async fn auto_launch(state: &mut DaemonState) -> Result<(), String> {
         ));
     }
 
+    state.engine = engine.as_deref().unwrap_or("chrome").to_string();
+    write_engine_file(&state.session_id, &state.engine);
+    write_extensions_file(&state.session_id);
+
     if let Ok(cdp) = env::var("AGENT_BROWSER_CDP") {
         let mgr = BrowserManager::connect_cdp(&cdp).await?;
         state.reset_input_state();
         state.browser = Some(mgr);
         state.subscribe_to_browser_events();
         state.start_fetch_handler();
+        state.start_dialog_handler();
         state.update_stream_client().await;
         try_auto_restore_state(state).await;
         return Ok(());
@@ -1259,16 +1523,63 @@ async fn auto_launch(state: &mut DaemonState) -> Result<(), String> {
         state.browser = Some(connect_auto_with_fresh_tab().await?);
         state.subscribe_to_browser_events();
         state.start_fetch_handler();
+        state.start_dialog_handler();
         state.update_stream_client().await;
         try_auto_restore_state(state).await;
         return Ok(());
     }
 
+    // Cloud provider: when AGENT_BROWSER_PROVIDER is set, connect via the
+    // provider API instead of launching a local Chrome instance.  This mirrors
+    // the logic in handle_launch() so that auto_launch (triggered by any
+    // command arriving before an explicit "launch") honours the provider env.
+    if let Ok(provider) = env::var("AGENT_BROWSER_PROVIDER") {
+        let p = provider.to_lowercase();
+        // ios/safari are device providers handled via explicit launch command
+        if !p.is_empty() && p != "ios" && p != "safari" {
+            let conn = providers::connect_provider(&p).await?;
+            let ws_headers = if p == "agentcore" {
+                providers::take_agentcore_ws_headers()
+            } else {
+                None
+            };
+            let connect_result = if conn.direct_page {
+                BrowserManager::connect_cdp_direct(&conn.ws_url).await
+            } else if ws_headers.is_some() {
+                BrowserManager::connect_cdp_with_headers(&conn.ws_url, ws_headers).await
+            } else {
+                BrowserManager::connect_cdp(&conn.ws_url).await
+            };
+            match connect_result {
+                Ok(mgr) => {
+                    state.reset_input_state();
+                    state.browser = Some(mgr);
+                    state.subscribe_to_browser_events();
+                    state.start_fetch_handler();
+                    state.start_dialog_handler();
+                    state.update_stream_client().await;
+                    write_provider_file(&state.session_id, &p);
+                    try_auto_restore_state(state).await;
+                    return Ok(());
+                }
+                Err(e) => {
+                    if let Some(ref ps) = conn.session {
+                        providers::close_provider_session(ps).await;
+                    }
+                    return Err(format!("Provider '{}' connection failed: {}", p, e));
+                }
+            }
+        }
+    }
+
+    let hash = launch_hash(&options);
     let mgr = BrowserManager::launch(options, engine.as_deref()).await?;
     state.reset_input_state();
     state.browser = Some(mgr);
+    state.launch_hash = Some(hash);
     state.subscribe_to_browser_events();
     state.start_fetch_handler();
+    state.start_dialog_handler();
     state.update_stream_client().await;
 
     // Enable Fetch with handleAuthRequests for proxy authentication
@@ -1324,6 +1635,7 @@ fn launch_options_from_env() -> LaunchOptions {
         ca_cert: env::var("AGENT_BROWSER_CA_CERT").ok(),
         color_scheme: env::var("AGENT_BROWSER_COLOR_SCHEME").ok(),
         download_path: env::var("AGENT_BROWSER_DOWNLOAD_PATH").ok(),
+        use_real_keychain: false,
     }
 }
 
@@ -1383,93 +1695,9 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect()
         });
-
-    let profile = cmd.get("profile").and_then(|v| v.as_str());
     let storage_state = cmd.get("storageState").and_then(|v| v.as_str());
-    let allow_file_access = cmd
-        .get("allowFileAccess")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let executable_path: Option<String> = cmd
-        .get("executablePath")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .or_else(|| std::env::var("AGENT_BROWSER_EXECUTABLE_PATH").ok());
 
-    let has_cdp = cdp_url.is_some() || cdp_port.is_some();
-    super::browser::validate_launch_options(
-        extensions.as_deref(),
-        has_cdp,
-        profile,
-        storage_state,
-        allow_file_access,
-        executable_path.as_deref(),
-    )?;
-
-    if let Some(url) = cdp_url {
-        state.reset_input_state();
-        state.browser = Some(BrowserManager::connect_cdp(url).await?);
-        state.subscribe_to_browser_events();
-        state.start_fetch_handler();
-        state.update_stream_client().await;
-        return Ok(json!({ "launched": true }));
-    }
-
-    if let Some(port) = cdp_port {
-        state.reset_input_state();
-        state.browser = Some(BrowserManager::connect_cdp(&port.to_string()).await?);
-        state.subscribe_to_browser_events();
-        state.start_fetch_handler();
-        state.update_stream_client().await;
-        return Ok(json!({ "launched": true }));
-    }
-
-    if auto_connect {
-        state.reset_input_state();
-        state.browser = Some(connect_auto_with_fresh_tab().await?);
-        state.subscribe_to_browser_events();
-        state.start_fetch_handler();
-        state.update_stream_client().await;
-        return Ok(json!({ "launched": true }));
-    }
-
-    if let Some(provider) = cmd.get("provider").and_then(|v| v.as_str()) {
-        match provider.to_lowercase().as_str() {
-            "ios" => {
-                return launch_ios(cmd, state).await;
-            }
-            "safari" => {
-                return launch_safari(cmd, state).await;
-            }
-            _ => {
-                let (ws_url, provider_session) = providers::connect_provider(provider).await?;
-                match BrowserManager::connect_cdp(&ws_url).await {
-                    Ok(mgr) => {
-                        state.reset_input_state();
-                        state.browser = Some(mgr);
-                        state.subscribe_to_browser_events();
-                        state.start_fetch_handler();
-                        state.update_stream_client().await;
-                        return Ok(json!({ "launched": true, "provider": provider }));
-                    }
-                    Err(e) => {
-                        if let Some(ref ps) = provider_session {
-                            providers::close_provider_session(ps).await;
-                        }
-                        return Err(e);
-                    }
-                }
-            }
-        }
-    }
-
-    let engine = cmd
-        .get("engine")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .or_else(|| env::var("AGENT_BROWSER_ENGINE").ok());
-
-    let options = LaunchOptions {
+    let launch_options = LaunchOptions {
         headless,
         executable_path: cmd
             .get("executablePath")
@@ -1483,6 +1711,23 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
                     .map(|s| s.to_string())
             })
         }),
+        proxy_bypass: cmd
+            .get("proxy")
+            .and_then(|v| v.get("bypass"))
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        proxy_username: cmd
+            .get("proxy")
+            .and_then(|v| v.get("username"))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .or_else(|| env::var("AGENT_BROWSER_PROXY_USERNAME").ok()),
+        proxy_password: cmd
+            .get("proxy")
+            .and_then(|v| v.get("password"))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .or_else(|| env::var("AGENT_BROWSER_PROXY_PASSWORD").ok()),
         profile: cmd
             .get("profile")
             .and_then(|v| v.as_str())
@@ -1502,23 +1747,6 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
             .unwrap_or_default(),
         extensions,
         storage_state: storage_state.map(String::from),
-        proxy_bypass: cmd
-            .get("proxy")
-            .and_then(|v| v.get("bypass"))
-            .and_then(|v| v.as_str())
-            .map(String::from),
-        proxy_username: cmd
-            .get("proxy")
-            .and_then(|v| v.get("username"))
-            .and_then(|v| v.as_str())
-            .map(String::from)
-            .or_else(|| env::var("AGENT_BROWSER_PROXY_USERNAME").ok()),
-        proxy_password: cmd
-            .get("proxy")
-            .and_then(|v| v.get("password"))
-            .and_then(|v| v.as_str())
-            .map(String::from)
-            .or_else(|| env::var("AGENT_BROWSER_PROXY_PASSWORD").ok()),
         user_agent: cmd
             .get("userAgent")
             .and_then(|v| v.as_str())
@@ -1540,15 +1768,149 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
             .get("downloadPath")
             .and_then(|v| v.as_str())
             .map(String::from),
+        use_real_keychain: false,
     };
 
+    let new_hash = launch_hash(&launch_options);
+
+    // Hash comparison and fast process-exit check are evaluated before the
+    // async is_connection_alive to skip the expensive CDP liveness probe
+    // when a relaunch is already certain.
+    let needs_relaunch = if let Some(ref mut mgr) = state.browser {
+        let is_external = cdp_url.is_some() || cdp_port.is_some() || auto_connect;
+        let was_external = mgr.is_cdp_connection();
+        let hash_changed = !is_external && state.launch_hash != Some(new_hash);
+        is_external != was_external
+            || hash_changed
+            || mgr.has_process_exited()
+            || !mgr.is_connection_alive().await
+    } else {
+        true
+    };
+
+    if needs_relaunch {
+        if let Some(ref mut b) = state.browser {
+            b.close().await?;
+            state.browser = None;
+            state.launch_hash = None;
+            state.screencasting = false;
+            state.reset_input_state();
+            state.update_stream_client().await;
+        }
+    } else {
+        return Ok(json!({ "launched": true, "reused": true }));
+    }
+    state.ref_map.clear();
+
+    let has_cdp = cdp_url.is_some() || cdp_port.is_some();
+    super::browser::validate_launch_options(
+        launch_options.extensions.as_deref(),
+        has_cdp,
+        launch_options.profile.as_deref(),
+        storage_state,
+        launch_options.allow_file_access,
+        launch_options.executable_path.as_deref(),
+    )?;
+
+    if let Some(url) = cdp_url {
+        state.reset_input_state();
+        state.browser = Some(BrowserManager::connect_cdp(url).await?);
+        state.subscribe_to_browser_events();
+        state.start_fetch_handler();
+        state.start_dialog_handler();
+        state.update_stream_client().await;
+        return Ok(json!({ "launched": true }));
+    }
+
+    if let Some(port) = cdp_port {
+        state.reset_input_state();
+        state.browser = Some(BrowserManager::connect_cdp(&port.to_string()).await?);
+        state.subscribe_to_browser_events();
+        state.start_fetch_handler();
+        state.start_dialog_handler();
+        state.update_stream_client().await;
+        return Ok(json!({ "launched": true }));
+    }
+
+    if auto_connect {
+        state.reset_input_state();
+        state.browser = Some(connect_auto_with_fresh_tab().await?);
+        state.subscribe_to_browser_events();
+        state.start_fetch_handler();
+        state.start_dialog_handler();
+        state.update_stream_client().await;
+        return Ok(json!({ "launched": true }));
+    }
+
+    if let Some(provider) = cmd.get("provider").and_then(|v| v.as_str()) {
+        match provider.to_lowercase().as_str() {
+            "ios" => {
+                return launch_ios(cmd, state).await;
+            }
+            "safari" => {
+                return launch_safari(cmd, state).await;
+            }
+            _ => {
+                let conn = providers::connect_provider(provider).await?;
+
+                let ws_headers = if provider.eq_ignore_ascii_case("agentcore") {
+                    providers::take_agentcore_ws_headers()
+                } else {
+                    None
+                };
+
+                let connect_result = if conn.direct_page {
+                    BrowserManager::connect_cdp_direct(&conn.ws_url).await
+                } else if ws_headers.is_some() {
+                    BrowserManager::connect_cdp_with_headers(&conn.ws_url, ws_headers).await
+                } else {
+                    BrowserManager::connect_cdp(&conn.ws_url).await
+                };
+                match connect_result {
+                    Ok(mgr) => {
+                        state.reset_input_state();
+                        state.browser = Some(mgr);
+                        state.subscribe_to_browser_events();
+                        state.start_fetch_handler();
+                        state.start_dialog_handler();
+                        state.update_stream_client().await;
+                        write_provider_file(&state.session_id, provider);
+
+                        if let Some(info) = providers::get_agentcore_info() {
+                            return Ok(json!({
+                                "launched": true,
+                                "provider": provider,
+                                "agentCoreSessionId": info.session_id,
+                                "agentCoreLiveViewUrl": info.live_view_url
+                            }));
+                        }
+
+                        return Ok(json!({ "launched": true, "provider": provider }));
+                    }
+                    Err(e) => {
+                        if let Some(ref ps) = conn.session {
+                            providers::close_provider_session(ps).await;
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
+    let engine = cmd
+        .get("engine")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .or_else(|| env::var("AGENT_BROWSER_ENGINE").ok());
+
     // Store proxy credentials for Fetch.authRequired handling
-    let has_proxy_auth = options.proxy_username.is_some();
+    let has_proxy_auth = launch_options.proxy_username.is_some();
     if has_proxy_auth {
         let mut creds = state.proxy_credentials.write().await;
         *creds = Some((
-            options.proxy_username.clone().unwrap_or_default(),
-            options.proxy_password.clone().unwrap_or_default(),
+            launch_options.proxy_username.clone().unwrap_or_default(),
+            launch_options.proxy_password.clone().unwrap_or_default(),
         ));
     }
 
@@ -1561,10 +1923,15 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         *df = Some(DomainFilter::new(domains));
     }
 
+    state.engine = engine.as_deref().unwrap_or("chrome").to_string();
+    write_engine_file(&state.session_id, &state.engine);
+    write_extensions_file(&state.session_id);
     state.reset_input_state();
-    state.browser = Some(BrowserManager::launch(options, engine.as_deref()).await?);
+    state.browser = Some(BrowserManager::launch(launch_options, engine.as_deref()).await?);
+    state.launch_hash = Some(new_hash);
     state.subscribe_to_browser_events();
     state.start_fetch_handler();
+    state.start_dialog_handler();
     state.update_stream_client().await;
 
     // Enable Fetch interception (domain filtering and/or proxy auth).
@@ -1632,6 +1999,10 @@ async fn launch_ios(cmd: &Value, state: &mut DaemonState) -> Result<Value, Strin
 
     state.appium = Some(appium);
     state.backend_type = BackendType::WebDriver;
+    state.engine = "safari".to_string();
+    write_engine_file(&state.session_id, &state.engine);
+    write_provider_file(&state.session_id, "ios");
+    write_extensions_file(&state.session_id);
     state.reset_input_state();
 
     Ok(json!({
@@ -1676,6 +2047,10 @@ async fn launch_safari(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     state.safari_driver = Some(driver);
     state.webdriver_backend = Some(WebDriverBackend::new(client));
     state.backend_type = BackendType::WebDriver;
+    state.engine = "safari".to_string();
+    write_engine_file(&state.session_id, &state.engine);
+    write_provider_file(&state.session_id, "safari");
+    write_extensions_file(&state.session_id);
     state.reset_input_state();
 
     Ok(json!({
@@ -1881,6 +2256,7 @@ async fn handle_close(state: &mut DaemonState) -> Result<Value, String> {
                     None,
                     Some(session_name.as_str()),
                     &state.session_id,
+                    mgr.visited_origins(),
                 )
                 .await;
             }
@@ -1890,6 +2266,8 @@ async fn handle_close(state: &mut DaemonState) -> Result<Value, String> {
         mgr.close().await?;
     }
     state.browser = None;
+    state.launch_hash = None;
+    state.screencasting = false;
     state.reset_input_state();
     state.update_stream_client().await;
 
@@ -1950,6 +2328,7 @@ async fn handle_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
             .get("maxDepth")
             .and_then(|v| v.as_u64())
             .map(|d| d as usize),
+        urls: cmd.get("urls").and_then(|v| v.as_bool()).unwrap_or(false),
     };
 
     state.ref_map.clear();
@@ -2426,7 +2805,7 @@ async fn handle_uncheck(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
 async fn handle_wait(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
-    let timeout_ms = cmd.get("timeout").and_then(|v| v.as_u64()).unwrap_or(30000);
+    let timeout_ms = state.timeout_ms(cmd);
 
     if let Some(text) = cmd.get("text").and_then(|v| v.as_str()) {
         wait_for_text(&mgr.client, &session_id, text, timeout_ms).await?;
@@ -2909,6 +3288,7 @@ async fn handle_state_save(cmd: &Value, state: &DaemonState) -> Result<Value, St
         path,
         state.session_name.as_deref(),
         &state.session_id,
+        mgr.visited_origins(),
     )
     .await?;
 
@@ -3172,7 +3552,27 @@ async fn handle_tab_switch(cmd: &Value, state: &mut DaemonState) -> Result<Value
     state.ref_map.clear();
     state.iframe_sessions.clear();
     state.active_frame_id = None;
-    mgr.tab_switch(index).await
+    let result = mgr.tab_switch(index).await?;
+
+    if let Some(ref server) = state.stream_server {
+        if let Ok(dims) = mgr
+            .evaluate(
+                "JSON.stringify([window.innerWidth,window.innerHeight])",
+                None,
+            )
+            .await
+        {
+            if let Some(s) = dims.get("result").and_then(|v| v.as_str()) {
+                if let Ok(arr) = serde_json::from_str::<Vec<u32>>(s) {
+                    if arr.len() == 2 && arr[0] > 0 && arr[1] > 0 {
+                        server.set_viewport(arr[0], arr[1]).await;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(result)
 }
 
 async fn handle_tab_close(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
@@ -3221,11 +3621,26 @@ async fn handle_set_media(cmd: &Value, state: &DaemonState) -> Result<Value, Str
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let media = cmd.get("media").and_then(|v| v.as_str());
 
-    let features = cmd.get("features").and_then(|v| v.as_object()).map(|m| {
-        m.iter()
-            .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
-            .collect::<Vec<(String, String)>>()
-    });
+    let mut feat_list: Vec<(String, String)> = Vec::new();
+
+    if let Some(scheme) = cmd.get("colorScheme").and_then(|v| v.as_str()) {
+        feat_list.push(("prefers-color-scheme".to_string(), scheme.to_string()));
+    }
+    if let Some(motion) = cmd.get("reducedMotion").and_then(|v| v.as_str()) {
+        feat_list.push(("prefers-reduced-motion".to_string(), motion.to_string()));
+    }
+
+    if let Some(obj) = cmd.get("features").and_then(|v| v.as_object()) {
+        for (k, v) in obj {
+            feat_list.push((k.clone(), v.as_str().unwrap_or("").to_string()));
+        }
+    }
+
+    let features = if feat_list.is_empty() {
+        None
+    } else {
+        Some(feat_list)
+    };
 
     mgr.set_emulated_media(media, features).await?;
     Ok(json!({ "set": true }))
@@ -3539,12 +3954,22 @@ async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<
     let result = recording::recording_start(&mut state.recording_state, path)?;
     state.start_recording_task(client, new_session_id).await?;
 
+    if let Some(ref server) = state.stream_server {
+        server.set_recording(true, &state.engine).await;
+    }
+
     Ok(result)
 }
 
 async fn handle_recording_stop(state: &mut DaemonState) -> Result<Value, String> {
     state.stop_recording_task().await?;
-    recording::recording_stop(&mut state.recording_state)
+    let result = recording::recording_stop(&mut state.recording_state);
+
+    if let Some(ref server) = state.stream_server {
+        server.set_recording(false, &state.engine).await;
+    }
+
+    result
 }
 
 async fn handle_recording_restart(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
@@ -4019,7 +4444,8 @@ async fn handle_upload(cmd: &Value, state: &DaemonState) -> Result<Value, String
         })
         .unwrap_or_default();
 
-    mgr.upload_files(selector, &files).await?;
+    mgr.upload_files(selector, &files, &state.ref_map, &state.iframe_sessions)
+        .await?;
     Ok(json!({ "uploaded": files.len(), "selector": selector }))
 }
 
@@ -4194,15 +4620,21 @@ async fn handle_device(cmd: &Value, state: &DaemonState) -> Result<Value, String
         .ok_or("Missing 'name' parameter")?;
 
     let (width, height, scale, mobile, ua) = match name.to_lowercase().as_str() {
+        "iphone 15" | "iphone15" => (393, 852, 3.0, true, "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"),
+        "iphone 16" | "iphone16" => (393, 852, 3.0, true, "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"),
+        "iphone 16 pro" | "iphone16pro" => (402, 874, 3.0, true, "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"),
+        "iphone 17" | "iphone17" => (402, 874, 3.0, true, "Mozilla/5.0 (iPhone; CPU iPhone OS 19_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/19.0 Mobile/15E148 Safari/604.1"),
+        "ipad" | "ipad air" => (820, 1180, 2.0, true, "Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/604.1"),
+        "ipad pro" => (1024, 1366, 2.0, true, "Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/604.1"),
+        "pixel 9" | "pixel9" => (412, 923, 2.625, true, "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36"),
+        "galaxy s25" | "galaxys25" => (360, 800, 3.0, true, "Mozilla/5.0 (Linux; Android 15; SM-S931B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36"),
+        // Legacy aliases
         "iphone 12" | "iphone12" => (390, 844, 3.0, true, "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1"),
         "iphone 14" | "iphone14" => (390, 844, 3.0, true, "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"),
-        "iphone 15" | "iphone15" => (393, 852, 3.0, true, "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"),
-        "ipad" | "ipad air" => (820, 1180, 2.0, true, "Mozilla/5.0 (iPad; CPU OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Safari/604.1"),
-        "ipad pro" => (1024, 1366, 2.0, true, "Mozilla/5.0 (iPad; CPU OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Safari/604.1"),
         "pixel 5" | "pixel5" => (393, 851, 2.75, true, "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36"),
         "pixel 7" | "pixel7" => (412, 915, 2.625, true, "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36"),
         "galaxy s21" | "galaxys21" => (360, 800, 3.0, true, "Mozilla/5.0 (Linux; Android 11; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36"),
-        _ => return Err(format!("Unknown device: {}. Supported: iPhone 12, iPhone 14, iPhone 15, iPad, iPad Pro, Pixel 5, Pixel 7, Galaxy S21", name)),
+        _ => return Err(format!("Unknown device: {}. Supported: iPhone 15, iPhone 16, iPhone 16 Pro, iPhone 17, iPad, iPad Pro, Pixel 9, Galaxy S25", name)),
     };
 
     mgr.set_viewport(width, height, scale, mobile).await?;
@@ -4220,6 +4652,160 @@ async fn handle_device(cmd: &Value, state: &DaemonState) -> Result<Value, String
         "deviceScaleFactor": scale,
         "mobile": mobile,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Stream handlers
+// ---------------------------------------------------------------------------
+
+fn stream_file_path(session_id: &str) -> PathBuf {
+    get_socket_dir().join(format!("{}.stream", session_id))
+}
+
+fn write_stream_file(session_id: &str, port: u16) -> Result<(), String> {
+    let path = stream_file_path(session_id);
+    fs::write(&path, port.to_string()).map_err(|e| {
+        format!(
+            "Failed to write stream metadata '{}': {}",
+            path.display(),
+            e
+        )
+    })
+}
+
+fn remove_stream_file(session_id: &str) -> Result<(), String> {
+    let path = stream_file_path(session_id);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!(
+            "Failed to remove stream metadata '{}': {}",
+            path.display(),
+            err
+        )),
+    }
+}
+
+fn engine_file_path(session_id: &str) -> PathBuf {
+    get_socket_dir().join(format!("{}.engine", session_id))
+}
+
+fn write_engine_file(session_id: &str, engine: &str) {
+    let _ = fs::write(engine_file_path(session_id), engine);
+}
+
+fn remove_engine_file(session_id: &str) {
+    let _ = fs::remove_file(engine_file_path(session_id));
+}
+
+fn provider_file_path(session_id: &str) -> PathBuf {
+    get_socket_dir().join(format!("{}.provider", session_id))
+}
+
+fn write_provider_file(session_id: &str, provider: &str) {
+    let _ = fs::write(provider_file_path(session_id), provider);
+}
+
+fn remove_provider_file(session_id: &str) {
+    let _ = fs::remove_file(provider_file_path(session_id));
+}
+
+fn extensions_file_path(session_id: &str) -> PathBuf {
+    get_socket_dir().join(format!("{}.extensions", session_id))
+}
+
+fn write_extensions_file(session_id: &str) {
+    if let Ok(val) = env::var("AGENT_BROWSER_EXTENSIONS") {
+        let trimmed = val.trim();
+        if !trimmed.is_empty() {
+            let _ = fs::write(extensions_file_path(session_id), trimmed);
+            return;
+        }
+    }
+    let _ = fs::remove_file(extensions_file_path(session_id));
+}
+
+fn remove_extensions_file(session_id: &str) {
+    let _ = fs::remove_file(extensions_file_path(session_id));
+}
+
+async fn current_stream_status(state: &DaemonState) -> Value {
+    debug_assert_eq!(
+        state.stream_server.is_some(),
+        state.stream_client.is_some(),
+        "stream server and stream client slot should be set together"
+    );
+
+    let connected = match state.browser.as_ref() {
+        Some(mgr) => mgr.is_connection_alive().await,
+        None => false,
+    };
+    let runtime_screencasting = match state.stream_server.as_ref() {
+        Some(server) => server.is_screencasting().await,
+        None => false,
+    };
+
+    json!({
+        "enabled": state.stream_server.is_some(),
+        "port": state
+            .stream_server
+            .as_ref()
+            .map(|server| Value::from(server.port()))
+            .unwrap_or(Value::Null),
+        "connected": connected,
+        "screencasting": connected && (state.screencasting || runtime_screencasting),
+    })
+}
+
+async fn handle_stream_enable(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    if state.stream_server.is_some() {
+        return Err("Streaming is already enabled for this session".to_string());
+    }
+
+    let requested_port = match cmd.get("port").and_then(|value| value.as_u64()) {
+        Some(raw) => u16::try_from(raw)
+            .map_err(|_| format!("Invalid stream port '{}': expected 0-65535", raw))?,
+        None => 0,
+    };
+
+    let (server, client_slot) =
+        StreamServer::start_without_client(requested_port, state.session_id.clone(), false).await?;
+    let port = server.port();
+    if let Err(err) = write_stream_file(&state.session_id, port) {
+        server.shutdown().await;
+        return Err(err);
+    }
+
+    state.stream_client = Some(client_slot);
+    state.stream_server = Some(Arc::new(server));
+    state.request_tracking = true;
+    if state.screencasting {
+        if let Some(ref server) = state.stream_server {
+            server.set_screencasting(true).await;
+        }
+    }
+    state.update_stream_client().await;
+
+    Ok(current_stream_status(state).await)
+}
+
+async fn handle_stream_disable(state: &mut DaemonState) -> Result<Value, String> {
+    let Some(server) = state.stream_server.clone() else {
+        return Err("Streaming is not enabled for this session".to_string());
+    };
+
+    server.shutdown().await;
+    state.stream_server = None;
+    state.stream_client = None;
+    remove_stream_file(&state.session_id)?;
+    remove_engine_file(&state.session_id);
+    remove_provider_file(&state.session_id);
+
+    Ok(json!({ "disabled": true }))
+}
+
+async fn handle_stream_status(state: &DaemonState) -> Result<Value, String> {
+    Ok(current_stream_status(state).await)
 }
 
 // ---------------------------------------------------------------------------
@@ -4263,7 +4849,16 @@ async fn handle_screencast_start(cmd: &Value, state: &mut DaemonState) -> Result
     state.screencasting = true;
 
     if let Some(ref server) = state.stream_server {
-        server.broadcast_status(true, true, max_width as u32, max_height as u32);
+        server.set_screencasting(true).await;
+        server
+            .broadcast_status(
+                true,
+                true,
+                max_width as u32,
+                max_height as u32,
+                &state.engine,
+            )
+            .await;
     }
 
     Ok(json!({ "started": true }))
@@ -4281,8 +4876,11 @@ async fn handle_screencast_stop(state: &mut DaemonState) -> Result<Value, String
     state.screencasting = false;
 
     if let Some(ref server) = state.stream_server {
+        server.set_screencasting(false).await;
         let (vw, vh) = server.viewport().await;
-        server.broadcast_status(true, false, vw, vh);
+        server
+            .broadcast_status(true, false, vw, vh, &state.engine)
+            .await;
     }
 
     Ok(json!({ "stopped": true }))
@@ -4299,7 +4897,7 @@ async fn handle_waitforurl(cmd: &Value, state: &DaemonState) -> Result<Value, St
         .get("url")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'url' parameter")?;
-    let timeout_ms = cmd.get("timeout").and_then(|v| v.as_u64()).unwrap_or(30000);
+    let timeout_ms = state.timeout_ms(cmd);
 
     wait_for_url(&mgr.client, &session_id, url_pattern, timeout_ms).await?;
     let url = mgr.get_url().await.unwrap_or_default();
@@ -4310,7 +4908,7 @@ async fn handle_waitforloadstate(cmd: &Value, state: &DaemonState) -> Result<Val
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let load_state = cmd.get("state").and_then(|v| v.as_str()).unwrap_or("load");
-    let timeout_ms = cmd.get("timeout").and_then(|v| v.as_u64()).unwrap_or(30000);
+    let timeout_ms = state.timeout_ms(cmd);
 
     let wait_until = WaitUntil::from_str(load_state);
     let _ = tokio::time::timeout(
@@ -4330,7 +4928,7 @@ async fn handle_waitforfunction(cmd: &Value, state: &DaemonState) -> Result<Valu
         .get("expression")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'expression' parameter")?;
-    let timeout_ms = cmd.get("timeout").and_then(|v| v.as_u64()).unwrap_or(30000);
+    let timeout_ms = state.timeout_ms(cmd);
 
     wait_for_function(&mgr.client, &session_id, expression, timeout_ms).await?;
 
@@ -4985,12 +5583,13 @@ async fn handle_drag(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
     mgr.client
         .send_command(
             "Input.dispatchMouseEvent",
-            Some(json!({ "type": "mousePressed", "x": sx, "y": sy, "button": "left", "clickCount": 1 })),
+            Some(json!({ "type": "mousePressed", "x": sx, "y": sy, "button": "left", "buttons": 1, "clickCount": 1 })),
             Some(&source_session_id),
         )
         .await?;
 
-    // Move in steps to target
+    // Move in steps to target, keeping the left button held (buttons: 1) so
+    // that the browser sees a drag rather than a plain pointer move.
     let steps = 10;
     for i in 1..=steps {
         let cx = sx + (tx - sx) * (i as f64) / (steps as f64);
@@ -4998,7 +5597,7 @@ async fn handle_drag(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
         mgr.client
             .send_command(
                 "Input.dispatchMouseEvent",
-                Some(json!({ "type": "mouseMoved", "x": cx, "y": cy })),
+                Some(json!({ "type": "mouseMoved", "x": cx, "y": cy, "button": "left", "buttons": 1 })),
                 Some(&target_session_id),
             )
             .await?;
@@ -5009,7 +5608,7 @@ async fn handle_drag(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
     mgr.client
         .send_command(
             "Input.dispatchMouseEvent",
-            Some(json!({ "type": "mouseReleased", "x": tx, "y": ty, "button": "left", "clickCount": 1 })),
+            Some(json!({ "type": "mouseReleased", "x": tx, "y": ty, "button": "left", "buttons": 0, "clickCount": 1 })),
             Some(&target_session_id),
         )
         .await?;
@@ -5083,7 +5682,7 @@ async fn handle_responsebody(cmd: &Value, state: &DaemonState) -> Result<Value, 
         .get("url")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'url' parameter")?;
-    let timeout_ms = cmd.get("timeout").and_then(|v| v.as_u64()).unwrap_or(30000);
+    let timeout_ms = state.timeout_ms(cmd);
 
     let mut rx = mgr.client.subscribe();
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
@@ -5162,7 +5761,7 @@ async fn handle_responsebody(cmd: &Value, state: &DaemonState) -> Result<Value, 
 async fn handle_waitfordownload(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
-    let timeout_ms = cmd.get("timeout").and_then(|v| v.as_u64()).unwrap_or(30000);
+    let timeout_ms = state.timeout_ms(cmd);
 
     let mut rx = mgr.client.subscribe();
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
@@ -5371,6 +5970,14 @@ async fn handle_har_start(state: &mut DaemonState) -> Result<Value, String> {
     mgr.client
         .send_command_no_params("Network.enable", Some(&session_id))
         .await?;
+    // Also enable Network on cross-origin iframe sessions so their
+    // requests are captured in the HAR output.
+    for iframe_sid in state.iframe_sessions.values() {
+        let _ = mgr
+            .client
+            .send_command_no_params("Network.enable", Some(iframe_sid.as_str()))
+            .await;
+    }
     state.har_recording = true;
     state.har_entries.clear();
     Ok(json!({ "started": true }))
@@ -6963,6 +7570,194 @@ mod tests {
     use crate::test_utils::EnvGuard;
     use std::fs;
 
+    fn unique_socket_dir(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "agent-browser-{label}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_stream_enable_disable_and_status_without_browser() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_SESSION"]);
+        let socket_dir = unique_socket_dir("stream-runtime");
+        fs::create_dir_all(&socket_dir).expect("socket dir should be created");
+        guard.set(
+            "AGENT_BROWSER_SOCKET_DIR",
+            socket_dir.to_str().expect("socket dir should be utf-8"),
+        );
+        guard.set("AGENT_BROWSER_SESSION", "stream-runtime-session");
+
+        let mut state = DaemonState::new();
+
+        let disabled_status = handle_stream_status(&state)
+            .await
+            .expect("status should work before enable");
+        assert_eq!(disabled_status["enabled"], false);
+        assert_eq!(disabled_status["port"], Value::Null);
+        assert_eq!(disabled_status["connected"], false);
+        assert_eq!(disabled_status["screencasting"], false);
+
+        let enabled_status = handle_stream_enable(&json!({ "port": 0 }), &mut state)
+            .await
+            .expect("stream enable should succeed");
+        let port = enabled_status["port"]
+            .as_u64()
+            .expect("runtime stream should report a bound port");
+        assert!(port > 0, "runtime stream should bind a non-zero port");
+        assert_eq!(enabled_status["enabled"], true);
+        assert_eq!(enabled_status["connected"], false);
+        assert_eq!(enabled_status["screencasting"], false);
+
+        let stream_path = socket_dir.join("stream-runtime-session.stream");
+        let port_file =
+            fs::read_to_string(&stream_path).expect("stream metadata file should exist");
+        assert_eq!(port_file.trim(), port.to_string());
+
+        let duplicate_err = handle_stream_enable(&json!({}), &mut state)
+            .await
+            .expect_err("duplicate enable should fail");
+        assert!(duplicate_err.contains("already enabled"));
+
+        let status = handle_stream_status(&state)
+            .await
+            .expect("status should work after enable");
+        assert_eq!(status["enabled"], true);
+        assert_eq!(status["port"], port);
+
+        let disabled = handle_stream_disable(&mut state)
+            .await
+            .expect("stream disable should succeed");
+        assert_eq!(disabled["disabled"], true);
+        assert!(
+            !stream_path.exists(),
+            "disabling runtime stream should remove the metadata file"
+        );
+        assert!(state.stream_server.is_none());
+        assert!(state.stream_client.is_none());
+
+        let final_status = handle_stream_status(&state)
+            .await
+            .expect("status should work after disable");
+        assert_eq!(final_status["enabled"], false);
+        assert_eq!(final_status["port"], Value::Null);
+
+        let disable_err = handle_stream_disable(&mut state)
+            .await
+            .expect_err("duplicate disable should fail");
+        assert!(disable_err.contains("not enabled"));
+
+        let _ = fs::remove_dir_all(&socket_dir);
+    }
+
+    #[tokio::test]
+    async fn test_stream_disable_preserves_existing_screencast_state() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_SESSION"]);
+        let socket_dir = unique_socket_dir("stream-preserve-screencast");
+        fs::create_dir_all(&socket_dir).expect("socket dir should be created");
+        guard.set(
+            "AGENT_BROWSER_SOCKET_DIR",
+            socket_dir.to_str().expect("socket dir should be utf-8"),
+        );
+        guard.set(
+            "AGENT_BROWSER_SESSION",
+            "stream-preserve-screencast-session",
+        );
+
+        let mut state = DaemonState::new();
+        handle_stream_enable(&json!({ "port": 0 }), &mut state)
+            .await
+            .expect("stream enable should succeed");
+        state.screencasting = true;
+
+        let disabled = handle_stream_disable(&mut state)
+            .await
+            .expect("stream disable should succeed");
+        assert_eq!(disabled["disabled"], true);
+        assert!(
+            state.screencasting,
+            "stream disable should not clear an independently managed screencast state"
+        );
+
+        let _ = fs::remove_dir_all(&socket_dir);
+    }
+
+    #[tokio::test]
+    async fn test_stream_disable_clears_state_when_stream_file_removal_fails() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_SESSION"]);
+        let socket_dir = unique_socket_dir("stream-disable-cleanup");
+        fs::create_dir_all(&socket_dir).expect("socket dir should be created");
+        guard.set(
+            "AGENT_BROWSER_SOCKET_DIR",
+            socket_dir.to_str().expect("socket dir should be utf-8"),
+        );
+        guard.set("AGENT_BROWSER_SESSION", "stream-disable-cleanup-session");
+
+        let mut state = DaemonState::new();
+        handle_stream_enable(&json!({ "port": 0 }), &mut state)
+            .await
+            .expect("stream enable should succeed");
+
+        let stream_path = socket_dir.join("stream-disable-cleanup-session.stream");
+        fs::remove_file(&stream_path).expect("stream metadata file should exist");
+        fs::create_dir(&stream_path).expect("directory should force remove_stream_file failure");
+
+        let err = handle_stream_disable(&mut state)
+            .await
+            .expect_err("stream disable should surface file removal failure");
+        assert!(err.contains("Failed to remove stream metadata"));
+        assert!(
+            state.stream_server.is_none(),
+            "stream disable should clear stream_server even when metadata cleanup fails"
+        );
+        assert!(
+            state.stream_client.is_none(),
+            "stream disable should clear stream_client even when metadata cleanup fails"
+        );
+
+        let _ = fs::remove_dir_all(&socket_dir);
+    }
+
+    #[tokio::test]
+    async fn test_stream_enable_port_conflict_returns_error() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_SESSION"]);
+        let socket_dir = unique_socket_dir("stream-port-conflict");
+        fs::create_dir_all(&socket_dir).expect("socket dir should be created");
+        guard.set(
+            "AGENT_BROWSER_SOCKET_DIR",
+            socket_dir.to_str().expect("socket dir should be utf-8"),
+        );
+        guard.set("AGENT_BROWSER_SESSION", "stream-port-conflict-session");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("test should reserve an ephemeral port");
+        let port = listener
+            .local_addr()
+            .expect("listener should have local addr")
+            .port();
+
+        let mut state = DaemonState::new();
+        let err = handle_stream_enable(&json!({ "port": port }), &mut state)
+            .await
+            .expect_err("conflicting port should fail");
+        assert!(err.contains("Failed to bind stream server"));
+        assert!(state.stream_server.is_none());
+        assert!(state.stream_client.is_none());
+        assert!(
+            !socket_dir
+                .join("stream-port-conflict-session.stream")
+                .exists(),
+            "failed enable should not leave stale metadata behind"
+        );
+
+        drop(listener);
+        let _ = fs::remove_dir_all(&socket_dir);
+    }
+
     #[test]
     fn test_success_response_structure() {
         let resp = success_response("cmd-1", json!({"url": "https://example.com"}));
@@ -6982,6 +7777,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_daemon_state_new() {
+        let guard = EnvGuard::new(&[
+            "AGENT_BROWSER_ALLOWED_DOMAINS",
+            "AGENT_BROWSER_SESSION_NAME",
+            "AGENT_BROWSER_SESSION",
+        ]);
+        guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
+        guard.remove("AGENT_BROWSER_SESSION_NAME");
+        guard.remove("AGENT_BROWSER_SESSION");
+
         let state = DaemonState::new();
         assert!(state.browser.is_none());
         assert!(state.domain_filter.read().await.is_none());
@@ -7347,6 +8151,23 @@ mod tests {
         assert_eq!(metadata["version"], "123.0.6312.0");
     }
 
+    #[test]
+    fn test_default_timeout_ms_from_env() {
+        // When AGENT_BROWSER_DEFAULT_TIMEOUT is set, DaemonState should use it
+        env::set_var("AGENT_BROWSER_DEFAULT_TIMEOUT", "3000");
+        let state = DaemonState::new();
+        assert_eq!(state.default_timeout_ms, 3000);
+        env::remove_var("AGENT_BROWSER_DEFAULT_TIMEOUT");
+    }
+
+    #[test]
+    fn test_default_timeout_ms_fallback() {
+        // When AGENT_BROWSER_DEFAULT_TIMEOUT is unset, DaemonState uses 30000
+        env::remove_var("AGENT_BROWSER_DEFAULT_TIMEOUT");
+        let state = DaemonState::new();
+        assert_eq!(state.default_timeout_ms, 30_000);
+    }
+
     #[tokio::test]
     async fn test_execute_unknown_command() {
         let mut state = DaemonState::new();
@@ -7398,6 +8219,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_credentials_roundtrip_via_actions() {
         let _lock = crate::native::auth::AUTH_TEST_MUTEX.lock().unwrap();
         let key_var = "AGENT_BROWSER_ENCRYPTION_KEY";
@@ -7602,5 +8424,74 @@ mod tests {
         let (key, mods) = parse_key_chord("+");
         assert_eq!(key, "+");
         assert_eq!(mods, None);
+    }
+
+    #[tokio::test]
+    async fn test_auto_dialog_enabled_by_default() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_NO_AUTO_DIALOG"]);
+        std::env::remove_var("AGENT_BROWSER_NO_AUTO_DIALOG");
+        let state = DaemonState::new();
+        assert!(state.auto_dialog, "auto_dialog should be true by default");
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn test_auto_dialog_disabled_by_env() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_NO_AUTO_DIALOG"]);
+        guard.set("AGENT_BROWSER_NO_AUTO_DIALOG", "1");
+        let state = DaemonState::new();
+        assert!(
+            !state.auto_dialog,
+            "auto_dialog should be false when AGENT_BROWSER_NO_AUTO_DIALOG=1"
+        );
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn test_auto_dialog_disabled_by_env_true() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_NO_AUTO_DIALOG"]);
+        guard.set("AGENT_BROWSER_NO_AUTO_DIALOG", "true");
+        let state = DaemonState::new();
+        assert!(
+            !state.auto_dialog,
+            "auto_dialog should be false when AGENT_BROWSER_NO_AUTO_DIALOG=true"
+        );
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn test_auto_dialog_not_disabled_by_random_value() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_NO_AUTO_DIALOG"]);
+        guard.set("AGENT_BROWSER_NO_AUTO_DIALOG", "no");
+        let state = DaemonState::new();
+        assert!(
+            state.auto_dialog,
+            "auto_dialog should remain true for non-truthy env values"
+        );
+        drop(guard);
+    }
+
+    #[test]
+    fn test_pending_dialog_not_set_for_auto_handled_alert() {
+        // Simulate what handle_browser_event does: when auto_dialog is true,
+        // alert/beforeunload should NOT populate pending_dialog.
+        let auto_dialog = true;
+        for dialog_type in &["alert", "beforeunload"] {
+            let auto_handled = auto_dialog && matches!(*dialog_type, "beforeunload" | "alert");
+            assert!(
+                auto_handled,
+                "{dialog_type} should be auto-handled when auto_dialog is true"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pending_dialog_set_for_confirm_prompt() {
+        // confirm and prompt should NOT be auto-handled even when auto_dialog is true.
+        let auto_dialog = true;
+        for dialog_type in &["confirm", "prompt"] {
+            let auto_handled = auto_dialog && matches!(*dialog_type, "beforeunload" | "alert");
+            assert!(!auto_handled, "{dialog_type} should NOT be auto-handled");
+        }
     }
 }

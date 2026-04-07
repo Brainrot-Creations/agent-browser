@@ -88,6 +88,8 @@ pub struct Config {
     pub screenshot_quality: Option<u32>,
     pub screenshot_format: Option<String>,
     pub idle_timeout: Option<String>,
+    pub no_auto_dialog: Option<bool>,
+    pub model: Option<String>,
 }
 
 impl Config {
@@ -134,6 +136,8 @@ impl Config {
             screenshot_quality: other.screenshot_quality.or(self.screenshot_quality),
             screenshot_format: other.screenshot_format.or(self.screenshot_format),
             idle_timeout: other.idle_timeout.or(self.idle_timeout),
+            no_auto_dialog: other.no_auto_dialog.or(self.no_auto_dialog),
+            model: other.model.or(self.model),
         }
     }
 }
@@ -220,6 +224,7 @@ fn extract_config_path(args: &[String]) -> Option<Option<String>> {
         "--screenshot-format",
         "--idle-timeout",
         "--ca-cert",
+        "--model",
     ];
     let mut i = 0;
     while i < args.len() {
@@ -302,6 +307,11 @@ pub struct Flags {
     pub screenshot_quality: Option<u32>,
     pub screenshot_format: Option<String>,
     pub idle_timeout: Option<String>, // Canonical milliseconds string for AGENT_BROWSER_IDLE_TIMEOUT_MS
+    pub default_timeout: Option<u64>, // AGENT_BROWSER_DEFAULT_TIMEOUT in ms
+    pub no_auto_dialog: bool,
+    pub model: Option<String>,
+    pub verbose: bool,
+    pub quiet: bool,
 
     // Track which launch-time options were explicitly passed via CLI
     // (as opposed to being set only via environment variables)
@@ -434,6 +444,14 @@ pub fn parse_flags(args: &[String]) -> Flags {
             "AGENT_BROWSER_IDLE_TIMEOUT_MS",
         )
         .or(config.idle_timeout),
+        default_timeout: env::var("AGENT_BROWSER_DEFAULT_TIMEOUT")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok()),
+        no_auto_dialog: env_var_is_truthy("AGENT_BROWSER_NO_AUTO_DIALOG")
+            || config.no_auto_dialog.unwrap_or(false),
+        model: env::var("AI_GATEWAY_MODEL").ok().or(config.model),
+        verbose: false,
+        quiet: false,
         cli_executable_path: false,
         cli_extensions: false,
         cli_profile: false,
@@ -714,6 +732,25 @@ pub fn parse_flags(args: &[String]) -> Flags {
                     i += 1;
                 }
             }
+            "--no-auto-dialog" => {
+                let (val, consumed) = parse_bool_arg(args, i);
+                flags.no_auto_dialog = val;
+                if consumed {
+                    i += 1;
+                }
+            }
+            "--model" => {
+                if let Some(s) = args.get(i + 1) {
+                    flags.model = Some(s.clone());
+                    i += 1;
+                }
+            }
+            "-v" | "--verbose" => {
+                flags.verbose = true;
+            }
+            "-q" | "--quiet" => {
+                flags.quiet = true;
+            }
             "--config" => {
                 // Already handled by load_config(); skip the value
                 i += 1;
@@ -740,6 +777,11 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
         "--annotate",
         "--content-boundaries",
         "--confirm-interactive",
+        "--no-auto-dialog",
+        "-v",
+        "--verbose",
+        "-q",
+        "--quiet",
     ];
     // Global flags that always take a value (need to skip the next arg too)
     const GLOBAL_FLAGS_WITH_VALUE: &[&str] = &[
@@ -771,6 +813,7 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
         "--screenshot-format",
         "--idle-timeout",
         "--ca-cert",
+        "--model",
     ];
 
     let mut i = 0;
@@ -1427,5 +1470,28 @@ mod tests {
         };
         let merged = user.merge(project);
         assert_eq!(merged.ca_cert, Some("/project/ca.crt".to_string()));
+    }
+
+    #[test]
+    fn test_no_auto_dialog_flag() {
+        let flags = parse_flags(&args("open example.com --no-auto-dialog"));
+        assert!(flags.no_auto_dialog);
+    }
+
+    #[test]
+    fn test_no_auto_dialog_default_false() {
+        let flags = parse_flags(&args("open example.com"));
+        assert!(!flags.no_auto_dialog);
+    }
+
+    #[test]
+    fn test_clean_args_removes_no_auto_dialog() {
+        let input: Vec<String> = vec![
+            "open".to_string(),
+            "example.com".to_string(),
+            "--no-auto-dialog".to_string(),
+        ];
+        let clean = clean_args(&input);
+        assert_eq!(clean, vec!["open", "example.com"]);
     }
 }

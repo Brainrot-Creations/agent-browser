@@ -1,3 +1,4 @@
+mod chat;
 mod color;
 mod commands;
 mod connection;
@@ -21,7 +22,7 @@ use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
 use commands::{gen_id, parse_command, ParseError};
-use connection::{ensure_daemon, get_socket_dir, send_command, DaemonOptions};
+use connection::{cleanup_stale_files, ensure_daemon, get_socket_dir, send_command, DaemonOptions};
 use flags::{clean_args, parse_flags, Flags};
 use install::run_install;
 use output::{
@@ -117,6 +118,64 @@ fn parse_proxy(proxy_str: &str) -> ParsedProxy {
     }
 }
 
+fn run_profiles(json_mode: bool) {
+    use crate::native::cdp::chrome::{find_chrome_user_data_dir, list_chrome_profiles};
+
+    let user_data_dir = match find_chrome_user_data_dir() {
+        Some(dir) => dir,
+        None => {
+            if json_mode {
+                print_json_error("No Chrome user data directory found");
+            } else {
+                eprintln!("{}", color::red("No Chrome user data directory found"));
+            }
+            exit(1);
+        }
+    };
+
+    let profiles = list_chrome_profiles(&user_data_dir);
+    if profiles.is_empty() {
+        if json_mode {
+            print_json_value(json!({
+                "success": true,
+                "data": []
+            }));
+        } else {
+            println!("No Chrome profiles found");
+        }
+        return;
+    }
+
+    if json_mode {
+        let items: Vec<serde_json::Value> = profiles
+            .iter()
+            .map(|p| {
+                json!({
+                    "directory": p.directory,
+                    "name": p.name
+                })
+            })
+            .collect();
+        print_json_value(json!({
+            "success": true,
+            "data": items
+        }));
+    } else {
+        println!(
+            "{} ({}):\n",
+            color::bold("Chrome profiles"),
+            user_data_dir.display()
+        );
+        for p in &profiles {
+            println!(
+                "  {}  {}",
+                color::bold(&p.directory),
+                color::dim(&format!("({})", p.name))
+            );
+        }
+    }
+}
+
 fn run_session(args: &[String], session: &str, json_mode: bool) {
     let subcommand = args.get(1).map(|s| s.as_str());
 
@@ -198,6 +257,320 @@ fn run_session(args: &[String], session: &str, json_mode: bool) {
     }
 }
 
+fn get_dashboard_pid_path() -> std::path::PathBuf {
+    get_socket_dir().join("dashboard.pid")
+}
+
+fn is_pid_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+    #[cfg(windows)]
+    {
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle != 0 {
+                CloseHandle(handle);
+                true
+            } else {
+                false
+            }
+        }
+    }
+}
+
+fn run_dashboard_start(port: u16, json_mode: bool) {
+    let pid_path = get_dashboard_pid_path();
+
+    // Check if already running
+    if let Ok(pid_str) = fs::read_to_string(&pid_path) {
+        if let Ok(pid) = pid_str.trim().parse::<u32>() {
+            if is_pid_alive(pid) {
+                if json_mode {
+                    print_json_value(json!({
+                        "success": true,
+                        "data": { "port": port, "pid": pid, "already_running": true },
+                    }));
+                } else {
+                    println!("Dashboard already running at http://localhost:{}", port);
+                }
+                return;
+            }
+        }
+        let _ = fs::remove_file(&pid_path);
+    }
+
+    let socket_dir = get_socket_dir();
+    if !socket_dir.exists() {
+        let _ = fs::create_dir_all(&socket_dir);
+    }
+
+    let exe_path = match env::current_exe() {
+        Ok(p) => p.canonicalize().unwrap_or(p),
+        Err(e) => {
+            if json_mode {
+                print_json_error(format!("Failed to get executable path: {}", e));
+            } else {
+                eprintln!(
+                    "{} Failed to get executable path: {}",
+                    color::error_indicator(),
+                    e
+                );
+            }
+            exit(1);
+        }
+    };
+
+    let mut cmd = std::process::Command::new(&exe_path);
+    cmd.env("AGENT_BROWSER_DASHBOARD", "1")
+        .env("AGENT_BROWSER_DASHBOARD_PORT", port.to_string());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+        const DETACHED_PROCESS: u32 = 0x00000008;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+    }
+
+    match cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => {
+            let pid = child.id();
+            let _ = fs::write(&pid_path, pid.to_string());
+
+            if json_mode {
+                print_json_value(json!({
+                    "success": true,
+                    "data": { "port": port, "pid": pid },
+                }));
+            } else {
+                println!("Dashboard started at http://localhost:{}", port);
+            }
+        }
+        Err(e) => {
+            if json_mode {
+                print_json_error(format!("Failed to start dashboard: {}", e));
+            } else {
+                eprintln!(
+                    "{} Failed to start dashboard: {}",
+                    color::error_indicator(),
+                    e
+                );
+            }
+            exit(1);
+        }
+    }
+}
+
+fn run_dashboard_stop(json_mode: bool) {
+    let pid_path = get_dashboard_pid_path();
+
+    let pid_str = match fs::read_to_string(&pid_path) {
+        Ok(s) => s,
+        Err(_) => {
+            if json_mode {
+                print_json_value(
+                    json!({ "success": true, "data": { "stopped": false, "reason": "not running" } }),
+                );
+            } else {
+                println!("Dashboard is not running");
+            }
+            return;
+        }
+    };
+
+    let pid: u32 = match pid_str.trim().parse() {
+        Ok(p) => p,
+        Err(_) => {
+            let _ = fs::remove_file(&pid_path);
+            if json_mode {
+                print_json_value(
+                    json!({ "success": true, "data": { "stopped": false, "reason": "invalid pid" } }),
+                );
+            } else {
+                println!("Dashboard is not running");
+            }
+            return;
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        unsafe {
+            libc::kill(pid as i32, libc::SIGTERM);
+        }
+    }
+    #[cfg(windows)]
+    {
+        unsafe {
+            let handle = OpenProcess(1, 0, pid); // PROCESS_TERMINATE = 1
+            if handle != 0 {
+                windows_sys::Win32::System::Threading::TerminateProcess(handle, 0);
+                CloseHandle(handle);
+            }
+        }
+    }
+
+    let _ = fs::remove_file(&pid_path);
+
+    if json_mode {
+        print_json_value(json!({ "success": true, "data": { "stopped": true } }));
+    } else {
+        println!("{} Dashboard stopped", color::green("✓"));
+    }
+}
+
+fn run_close_all(flags: &Flags) {
+    let socket_dir = get_socket_dir();
+    let mut sessions: Vec<(String, u32)> = Vec::new();
+
+    if let Ok(entries) = fs::read_dir(&socket_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if let Some(session_name) = name.strip_suffix(".pid") {
+                if session_name.is_empty() {
+                    continue;
+                }
+                let pid_path = socket_dir.join(&name);
+                if let Ok(pid_str) = fs::read_to_string(&pid_path) {
+                    if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                        #[cfg(unix)]
+                        let running = unsafe {
+                            libc::kill(pid as i32, 0) == 0
+                                || std::io::Error::last_os_error().raw_os_error()
+                                    != Some(libc::ESRCH)
+                        };
+                        #[cfg(windows)]
+                        let running = unsafe {
+                            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+                            if handle != 0 {
+                                CloseHandle(handle);
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if running {
+                            sessions.push((session_name.to_string(), pid));
+                        } else {
+                            // Process is gone but stale files remain; clean them up
+                            cleanup_stale_files(session_name);
+                        }
+                    }
+                } else {
+                    // PID file exists but is unreadable; clean up stale files
+                    cleanup_stale_files(session_name);
+                }
+            }
+        }
+    }
+
+    // Also scan for orphaned .sock files without corresponding .pid files
+    #[cfg(unix)]
+    if let Ok(entries) = fs::read_dir(&socket_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if let Some(session_name) = name.strip_suffix(".sock") {
+                if session_name.is_empty() {
+                    continue;
+                }
+                let pid_path = socket_dir.join(format!("{}.pid", session_name));
+                if !pid_path.exists() {
+                    // Orphaned socket file with no PID file; remove it
+                    cleanup_stale_files(session_name);
+                }
+            }
+        }
+    }
+
+    if sessions.is_empty() {
+        if flags.json {
+            print_json_value(json!({
+                "success": true,
+                "data": { "closed": 0, "sessions": [] },
+            }));
+        } else {
+            println!("No active sessions");
+        }
+        return;
+    }
+
+    let mut closed: Vec<String> = Vec::new();
+    let mut failed: Vec<(String, String)> = Vec::new();
+
+    for (session, pid) in &sessions {
+        let cmd = json!({ "id": gen_id(), "action": "close" });
+        match send_command(cmd, session) {
+            Ok(resp) if resp.success => closed.push(session.clone()),
+            Ok(resp) => {
+                let err = resp.error.unwrap_or_else(|| "Unknown error".to_string());
+                failed.push((session.clone(), err));
+            }
+            Err(_) => {
+                // Daemon is unreachable despite its process existing.
+                // Force-kill the process and clean up stale files so future
+                // sessions are not poisoned.
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(*pid as i32, libc::SIGKILL);
+                }
+                #[cfg(windows)]
+                unsafe {
+                    let handle = OpenProcess(1, 0, *pid); // PROCESS_TERMINATE = 1
+                    if handle != 0 {
+                        windows_sys::Win32::System::Threading::TerminateProcess(handle, 1);
+                        CloseHandle(handle);
+                    }
+                }
+                cleanup_stale_files(session);
+                closed.push(session.clone());
+            }
+        }
+    }
+
+    if flags.json {
+        print_json_value(json!({
+            "success": failed.is_empty(),
+            "data": {
+                "closed": closed.len(),
+                "sessions": closed,
+                "failed": failed.iter().map(|(s, e)| json!({"session": s, "error": e})).collect::<Vec<_>>(),
+            },
+        }));
+    } else {
+        for s in &closed {
+            println!("{} Closed session: {}", color::green("✓"), s);
+        }
+        for (s, e) in &failed {
+            eprintln!("{} Failed to close {}: {}", color::error_indicator(), s, e);
+        }
+        if closed.is_empty() && !failed.is_empty() {
+            exit(1);
+        }
+    }
+
+    if !failed.is_empty() {
+        exit(1);
+    }
+}
+
 fn main() {
     // Rust ignores SIGPIPE by default, causing println! to panic on broken pipes.
     // Reset to SIG_DFL so the OS terminates the process cleanly instead.
@@ -224,6 +597,17 @@ fn main() {
         let session = env::var("AGENT_BROWSER_SESSION").unwrap_or_else(|_| "default".to_string());
         let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
         rt.block_on(native::daemon::run_daemon(&session));
+        return;
+    }
+
+    // Standalone dashboard server mode
+    if env::var("AGENT_BROWSER_DASHBOARD").is_ok() {
+        let port: u16 = env::var("AGENT_BROWSER_DASHBOARD_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4848);
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+        rt.block_on(native::stream::run_dashboard_server(port));
         return;
     }
 
@@ -267,9 +651,64 @@ fn main() {
         return;
     }
 
+    // Handle dashboard subcommand
+    if clean.first().map(|s| s.as_str()) == Some("dashboard") {
+        match clean.get(1).map(|s| s.as_str()) {
+            Some("start") | None => {
+                let port = clean
+                    .iter()
+                    .position(|a| a == "--port")
+                    .and_then(|i| clean.get(i + 1))
+                    .and_then(|s| s.parse::<u16>().ok())
+                    .unwrap_or(4848);
+                run_dashboard_start(port, flags.json);
+                return;
+            }
+            Some("stop") => {
+                run_dashboard_stop(flags.json);
+                return;
+            }
+            Some(unknown) => {
+                eprintln!(
+                    "{} Unknown dashboard subcommand: {}",
+                    color::error_indicator(),
+                    unknown
+                );
+                exit(1);
+            }
+        }
+    }
+
+    // Handle profiles command (doesn't need daemon)
+    if clean.first().map(|s| s.as_str()) == Some("profiles") {
+        run_profiles(flags.json);
+        return;
+    }
+
     // Handle session separately (doesn't need daemon)
     if clean.first().map(|s| s.as_str()) == Some("session") {
         run_session(&clean, &flags.session, flags.json);
+        return;
+    }
+
+    // Handle close --all: close all active sessions
+    if matches!(
+        clean.first().map(|s| s.as_str()),
+        Some("close") | Some("quit") | Some("exit")
+    ) && clean.iter().any(|a| a == "--all")
+    {
+        run_close_all(&flags);
+        return;
+    }
+
+    // Handle chat command
+    if clean.first().map(|s| s.as_str()) == Some("chat") {
+        let message = if clean.len() > 1 {
+            Some(clean[1..].join(" "))
+        } else {
+            None
+        };
+        chat::run_chat(&flags, message);
         return;
     }
 
@@ -409,8 +848,11 @@ fn main() {
         engine: flags.engine.as_deref(),
         auto_connect: flags.auto_connect,
         idle_timeout: flags.idle_timeout.as_deref(),
+        default_timeout: flags.default_timeout,
         cdp: flags.cdp.as_deref(),
+        no_auto_dialog: flags.no_auto_dialog,
     };
+
     let daemon_result = match ensure_daemon(&flags.session, &daemon_opts) {
         Ok(result) => result,
         Err(e) => {
@@ -850,10 +1292,16 @@ fn main() {
         }
     }
 
-    // Handle batch command: read commands from stdin, execute sequentially
+    // Handle batch command: from args or stdin
     if cmd.get("action").and_then(|v| v.as_str()) == Some("batch") {
         let bail = cmd.get("bail").and_then(|v| v.as_bool()).unwrap_or(false);
-        run_batch(&flags, bail);
+        let arg_commands = cmd.get("commands").and_then(|v| v.as_array()).map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(commands::shell_words_split)
+                .collect::<Vec<Vec<String>>>()
+        });
+        run_batch(&flags, bail, arg_commands);
         return;
     }
 
@@ -933,35 +1381,39 @@ fn main() {
     }
 }
 
-fn run_batch(flags: &Flags, bail: bool) {
-    use std::io::Read as _;
+fn run_batch(flags: &Flags, bail: bool, arg_commands: Option<Vec<Vec<String>>>) {
+    let commands: Vec<Vec<String>> = if let Some(cmds) = arg_commands {
+        cmds
+    } else {
+        use std::io::Read as _;
 
-    let mut input = String::new();
-    if let Err(e) = std::io::stdin().read_to_string(&mut input) {
-        if flags.json {
-            print_json_error(format!("Failed to read stdin: {}", e));
-        } else {
-            eprintln!("{} Failed to read stdin: {}", color::error_indicator(), e);
-        }
-        exit(1);
-    }
-
-    let commands: Vec<Vec<String>> = match serde_json::from_str(&input) {
-        Ok(c) => c,
-        Err(e) => {
+        let mut input = String::new();
+        if let Err(e) = std::io::stdin().read_to_string(&mut input) {
             if flags.json {
-                print_json_error(format!(
-                    "Invalid JSON input: {}. Expected an array of string arrays, e.g. [[\"open\", \"https://example.com\"], [\"snapshot\"]]",
-                    e
-                ));
+                print_json_error(format!("Failed to read stdin: {}", e));
             } else {
-                eprintln!(
-                    "{} Invalid JSON input: {}. Expected an array of string arrays.",
-                    color::error_indicator(),
-                    e
-                );
+                eprintln!("{} Failed to read stdin: {}", color::error_indicator(), e);
             }
             exit(1);
+        }
+
+        match serde_json::from_str(&input) {
+            Ok(c) => c,
+            Err(e) => {
+                if flags.json {
+                    print_json_error(format!(
+                        "Invalid JSON input: {}. Expected an array of string arrays, e.g. [[\"open\", \"https://example.com\"], [\"snapshot\"]]",
+                        e
+                    ));
+                } else {
+                    eprintln!(
+                        "{} Invalid JSON input: {}. Expected an array of string arrays.",
+                        color::error_indicator(),
+                        e
+                    );
+                }
+                exit(1);
+            }
         }
     };
 
