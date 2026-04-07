@@ -1,0 +1,38 @@
+name: Sync skills from upstream
+
+on:
+  schedule:
+    - cron: '0 5 * * *'   # daily at 05:00 UTC (runs before claude-plugins sync at 06:00)
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch skills from vercel-labs/agent-browser
+        run: |
+          git remote add upstream https://github.com/vercel-labs/agent-browser.git
+          git fetch upstream main --no-tags
+
+          # Overlay only the skills/ directory from upstream
+          git checkout upstream/main -- skills/
+
+      - name: Commit if changed
+        run: |
+          if git diff --cached --quiet; then
+            echo "No changes — skills are already up to date"
+            exit 0
+          fi
+
+          git commit -m "chore: sync skills from vercel-labs/agent-browser"
+          git push
