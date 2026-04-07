@@ -1,19 +1,19 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "agent-browser",
-  "description": "Browser automation for AI agents",
+  "description": "Fast native browser automation for AI agents",
   "owner": {
-    "name": "Vercel",
-    "email": "support@vercel.com"
+    "name": "Brainrot Creations",
+    "email": "support@brainrotcreations.com"
   },
   "plugins": [
     {
       "name": "agent-browser",
-      "description": "Automates browser interactions for web testing, form filling, screenshots, and data extraction",
+      "description": "Fast native browser automation for AI agents. Navigate, screenshot, fill forms, click, and extract data from any webpage via Chrome DevTools Protocol.",
       "source": "./",
       "strict": false,
       "skills": ["./skills/agent-browser"],
-      "category": "development"
+      "category": "developer-tools"
     }
   ]
 }
